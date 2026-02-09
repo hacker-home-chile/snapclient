@@ -1,9 +1,9 @@
 menu "Snapclient Configuration"
     config SNAPCLIENT_USE_TIMEFILTER
-        bool "Use Kalmann Timefilter"
-        default n
+        bool "Use Kalman Timefilter"
+        default y
         help
-            Use Kalmann Timefilter for latency to server estimation. The default is a median filter.
+            Use Kalman Timefilter for latency to server estimation. The non default is a median filter.
             
     config SNAPSERVER_USE_MDNS
         bool "Use mDNS"
