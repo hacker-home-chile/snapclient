@@ -41,4 +41,14 @@ menu "ESP32 DSP processor config"
         help
             Use software volume mixer instead of hardware mixer.
 
+    config SNAPCLIENT_MAX_VOLUME_PERCENT
+        int "Maximum volume percent"
+        default 80
+        range 10 100
+        depends on SNAPCLIENT_USE_SOFT_VOL
+        help
+            Limits the maximum volume to prevent clipping and distortion.
+            100 = full scale (no limit), 80 = 80% max (~2dB headroom),
+            50 = 50% max (~6dB headroom). Default is 80.
+
 endmenu

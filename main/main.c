@@ -19,7 +19,8 @@
 #include "freertos/task.h"
 #include "hal/gpio_types.h"
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
-    CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
+    CONFIG_SNAPCLIENT_USE_SPI_ETHERNET || \
+    CONFIG_ETH_USE_OPENETH
 #include "eth_interface.h"
 #endif
 
@@ -159,6 +160,32 @@ struct netconn *lwipNetconn;
 
 static int id_counter = 0;
 
+// Clock sync: offset from esp_timer (boot time) to wall-clock time, set from
+// the server's timestamp on first contact.
+static bool clock_synced_from_server = false;
+static int64_t boot_to_wall_offset_us = 0;
+
+static inline int64_t get_sync_time_us(void) {
+  return esp_timer_get_time() + boot_to_wall_offset_us;
+}
+
+// UDP streaming state
+#define UDP_SERVER_PORT 1706
+#define UDP_RECV_TASK_PRIORITY 8
+#define UDP_RECV_TASK_CORE_ID tskNO_AFFINITY
+#define UDP_RECV_BUF_SIZE 2048
+
+static struct netconn *udpNetconn = NULL;
+static TaskHandle_t t_udp_recv_task = NULL;
+static volatile bool udp_active = false;
+static uint16_t udp_expected_sequence = 0;
+static bool udp_sequence_initialized = false;
+// Cached last opus packet data + length for FEC decoding
+static uint8_t *udp_last_opus_pkt = NULL;
+static uint32_t udp_last_opus_pkt_len = 0;
+
+static char udp_client_mac[18];  // MAC address for UDP re-registration
+
 static OpusDecoder *opusDecoder = NULL;
 
 static decoderData_t decoderChunk = {
@@ -217,7 +244,7 @@ void time_sync_msg_cb(void *args) {
   base_message_tx.refersTo = 0;
   base_message_tx.received.sec = 0;
   base_message_tx.received.usec = 0;
-  now = esp_timer_get_time();
+  now = get_sync_time_us();
   base_message_tx.sent.sec = now / 1000000;
   base_message_tx.sent.usec = now - base_message_tx.sent.sec * 1000000;
   base_message_tx.size = TIME_MESSAGE_SIZE;
@@ -464,6 +491,287 @@ void audio_set_volume(int volume) {
 /**
  *
  */
+/**
+ * UDP receive task: receives WireChunk datagrams from the server,
+ * decodes Opus with FEC/PLC awareness, and inserts PCM into the player queue.
+ */
+static void udp_recv_task(void *pvParameters) {
+  snapcastSetting_t *scSetPtr = (snapcastSetting_t *)pvParameters;
+  struct netbuf *buf = NULL;
+  int rc;
+
+  // Stats counters (logged periodically to avoid serial spam)
+  uint32_t udp_pkts_received = 0;
+  uint32_t udp_pkts_decoded = 0;
+  uint32_t udp_pkts_dropped = 0;
+  uint32_t udp_pkts_fec_recovered = 0;
+  TickType_t last_stats_tick = xTaskGetTickCount();
+  const TickType_t stats_interval = pdMS_TO_TICKS(10000);  // log every 10s
+
+  // Create a dedicated Opus decoder for this task (the shared opusDecoder
+  // is not thread-safe and may be used concurrently by the TCP task)
+  int opus_err = 0;
+  OpusDecoder *udpOpusDecoder = opus_decoder_create(scSetPtr->sr, scSetPtr->ch, &opus_err);
+  if (opus_err != 0 || udpOpusDecoder == NULL) {
+    ESP_LOGE(TAG, "UDP: failed to create opus decoder: %d", opus_err);
+    vTaskDelete(NULL);
+    return;
+  }
+
+  ESP_LOGI(TAG, "UDP recv task started (opus decoder: %ldHz %dch)", scSetPtr->sr, scSetPtr->ch);
+
+  bool settings_sent = false;
+
+  // Set receive timeout so the loop can run re-registration even when
+  // no packets are arriving (e.g. after server restart or NAT expiry).
+  netconn_set_recvtimeout(udpNetconn, 1000);  // 1 second
+
+  // Periodic re-registration to handle packet loss, NAT timeout, or server restart
+  TickType_t last_reg_tick = xTaskGetTickCount();
+  const TickType_t reg_interval = pdMS_TO_TICKS(5000);  // re-register every 5s
+
+  while (udp_active) {
+    // Periodically re-send registration packet
+    TickType_t cur_tick = xTaskGetTickCount();
+    if ((cur_tick - last_reg_tick) >= reg_interval) {
+      uint16_t mac_len = strlen(udp_client_mac);
+      struct netbuf *reg_buf = netbuf_new();
+      if (reg_buf) {
+        uint8_t reg_pkt[2 + 18];  // 2-byte prefix + max MAC string
+        reg_pkt[0] = mac_len & 0xFF;
+        reg_pkt[1] = (mac_len >> 8) & 0xFF;
+        memcpy(reg_pkt + 2, udp_client_mac, mac_len);
+        netbuf_ref(reg_buf, reg_pkt, 2 + mac_len);
+        netconn_send(udpNetconn, reg_buf);
+        netbuf_delete(reg_buf);
+      }
+      last_reg_tick = cur_tick;
+    }
+
+    rc = netconn_recv(udpNetconn, &buf);
+    if (rc != ERR_OK) {
+      if (!udp_active) break;
+      if (buf) netbuf_delete(buf);
+      buf = NULL;
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+
+    void *data;
+    uint16_t data_len;
+    netbuf_data(buf, &data, &data_len);
+
+    udp_pkts_received++;
+
+    // Periodic stats log
+    TickType_t now_tick = xTaskGetTickCount();
+    if ((now_tick - last_stats_tick) >= stats_interval) {
+      ESP_LOGI(TAG, "UDP stats: recv=%lu decoded=%lu dropped=%lu fec=%lu",
+               (unsigned long)udp_pkts_received, (unsigned long)udp_pkts_decoded,
+               (unsigned long)udp_pkts_dropped, (unsigned long)udp_pkts_fec_recovered);
+      last_stats_tick = now_tick;
+    }
+
+    // A UDP datagram must contain at least a base_message header (26 bytes)
+    // + WireChunk header (12 bytes: timestamp 8 + size 4)
+    if (data_len < BASE_MESSAGE_SIZE + 12) {
+      udp_pkts_dropped++;
+      netbuf_delete(buf);
+      buf = NULL;
+      continue;
+    }
+
+    uint8_t *pkt = (uint8_t *)data;
+
+    // Parse base_message header (little-endian)
+    uint16_t msg_type = pkt[0] | (pkt[1] << 8);
+    uint16_t msg_id = pkt[2] | (pkt[3] << 8);  // sequence number
+
+    // We only handle WireChunk (type 2)
+    if (msg_type != SNAPCAST_MESSAGE_WIRE_CHUNK) {
+      netbuf_delete(buf);
+      buf = NULL;
+      continue;
+    }
+
+    // Parse WireChunk header after base_message (26 bytes)
+    uint8_t *wc = pkt + BASE_MESSAGE_SIZE;
+    int32_t ts_sec = wc[0] | (wc[1] << 8) | (wc[2] << 16) | (wc[3] << 24);
+    int32_t ts_usec = wc[4] | (wc[5] << 8) | (wc[6] << 16) | (wc[7] << 24);
+    uint32_t payload_size = wc[8] | (wc[9] << 8) | (wc[10] << 16) | (wc[11] << 24);
+
+    uint8_t *opus_data = wc + 12;
+    uint32_t opus_len = payload_size;
+
+    // Bounds check
+    if (BASE_MESSAGE_SIZE + 12 + opus_len > data_len) {
+      udp_pkts_dropped++;
+      netbuf_delete(buf);
+      buf = NULL;
+      continue;
+    }
+
+    // Sequence gap detection
+    uint16_t gap = 0;
+    if (udp_sequence_initialized) {
+      gap = (uint16_t)(msg_id - udp_expected_sequence);
+      if (gap > 1000) gap = 0;  // wrapped or reordered, treat as normal
+    } else {
+      udp_sequence_initialized = true;
+    }
+    udp_expected_sequence = msg_id + 1;
+
+    if (scSetPtr->sr == 0 || scSetPtr->ch == 0 || scSetPtr->bits == 0) {
+      udp_pkts_dropped++;
+      netbuf_delete(buf);
+      buf = NULL;
+      continue;
+    }
+
+    int samples_per_frame = opus_packet_get_samples_per_frame(opus_data, scSetPtr->sr);
+    if (samples_per_frame < 0) {
+      netbuf_delete(buf);
+      buf = NULL;
+      continue;
+    }
+
+    size_t pcm_bytes = samples_per_frame * (scSetPtr->ch * scSetPtr->bits >> 3);
+
+    // Handle packet loss via FEC/PLC
+    if (gap > 0) {
+      // For gaps > 1, use PLC for the earlier lost packets
+      for (uint16_t i = 0; i < gap - 1 && i < 3; i++) {
+        opus_int16 *plc_audio = (opus_int16 *)malloc(pcm_bytes);
+        if (plc_audio) {
+          int plc_size = opus_decode(udpOpusDecoder, NULL, 0, plc_audio, samples_per_frame, 0);
+          if (plc_size > 0) {
+            pcm_chunk_message_t *plc_chunk = NULL;
+            if (allocate_pcm_chunk_memory(&plc_chunk, pcm_bytes) >= 0) {
+              // Interpolate timestamp for PLC frame
+              int64_t chunk_dur_us = 1000000LL * samples_per_frame / scSetPtr->sr;
+              int64_t base_ts = (int64_t)ts_sec * 1000000LL + ts_usec;
+              int64_t plc_ts = base_ts - (int64_t)(gap - i) * chunk_dur_us;
+              plc_chunk->timestamp.sec = plc_ts / 1000000LL;
+              plc_chunk->timestamp.usec = plc_ts % 1000000LL;
+
+              if (plc_chunk->fragment->payload) {
+                uint32_t cnt = 0;
+                for (int j = 0; j < (int)pcm_bytes; j += 4) {
+                  volatile uint32_t *sample = (volatile uint32_t *)(&plc_chunk->fragment->payload[j]);
+                  uint32_t tmpData = (((uint32_t)plc_audio[cnt] << 16) & 0xFFFF0000) |
+                                     (((uint32_t)plc_audio[cnt + 1] << 0) & 0x0000FFFF);
+                  *sample = (volatile uint32_t)tmpData;
+                  cnt += 2;
+                }
+              }
+              insert_pcm_chunk(plc_chunk);
+            }
+          }
+          free(plc_audio);
+        }
+      }
+
+      // For the most recently lost packet, use FEC from current packet
+      opus_int16 *fec_audio = (opus_int16 *)malloc(pcm_bytes);
+      if (fec_audio) {
+        int fec_size = opus_decode(udpOpusDecoder, opus_data, opus_len, fec_audio, samples_per_frame, 1);
+        if (fec_size > 0) {
+          pcm_chunk_message_t *fec_chunk = NULL;
+          if (allocate_pcm_chunk_memory(&fec_chunk, pcm_bytes) >= 0) {
+            int64_t chunk_dur_us = 1000000LL * samples_per_frame / scSetPtr->sr;
+            int64_t base_ts = (int64_t)ts_sec * 1000000LL + ts_usec;
+            int64_t fec_ts = base_ts - chunk_dur_us;
+            fec_chunk->timestamp.sec = fec_ts / 1000000LL;
+            fec_chunk->timestamp.usec = fec_ts % 1000000LL;
+
+            if (fec_chunk->fragment->payload) {
+              uint32_t cnt = 0;
+              for (int j = 0; j < (int)pcm_bytes; j += 4) {
+                volatile uint32_t *sample = (volatile uint32_t *)(&fec_chunk->fragment->payload[j]);
+                uint32_t tmpData = (((uint32_t)fec_audio[cnt] << 16) & 0xFFFF0000) |
+                                   (((uint32_t)fec_audio[cnt + 1] << 0) & 0x0000FFFF);
+                *sample = (volatile uint32_t)tmpData;
+                cnt += 2;
+              }
+            }
+            insert_pcm_chunk(fec_chunk);
+          }
+        }
+        free(fec_audio);
+      }
+
+      if (gap > 0) {
+        udp_pkts_fec_recovered += gap;
+        ESP_LOGW(TAG, "UDP: lost %d packets, recovered with FEC/PLC", gap);
+      }
+    }
+
+    // Normal decode of current packet
+    opus_int16 *audio = (opus_int16 *)malloc(pcm_bytes);
+    if (audio) {
+      int frame_size = opus_decode(udpOpusDecoder, opus_data, opus_len, audio, samples_per_frame, 0);
+      if (frame_size > 0) {
+        pcm_chunk_message_t *new_chunk = NULL;
+        if (allocate_pcm_chunk_memory(&new_chunk, pcm_bytes) >= 0) {
+          new_chunk->timestamp.sec = ts_sec;
+          new_chunk->timestamp.usec = ts_usec;
+
+          if (new_chunk->fragment->payload) {
+            uint32_t cnt = 0;
+            for (int j = 0; j < (int)pcm_bytes; j += 4) {
+              volatile uint32_t *sample = (volatile uint32_t *)(&new_chunk->fragment->payload[j]);
+              uint32_t tmpData = (((uint32_t)audio[cnt] << 16) & 0xFFFF0000) |
+                                 (((uint32_t)audio[cnt + 1] << 0) & 0x0000FFFF);
+              *sample = (volatile uint32_t)tmpData;
+              cnt += 2;
+            }
+          }
+
+#if CONFIG_USE_DSP_PROCESSOR
+          if (new_chunk->fragment->payload) {
+            dsp_processor_worker(new_chunk->fragment->payload,
+                                 new_chunk->fragment->size, scSetPtr->sr);
+          }
+#endif
+
+          insert_pcm_chunk(new_chunk);
+          udp_pkts_decoded++;
+
+          // After first successful decode, update chkInFrames with
+          // actual frame size and push settings to the player task.
+          if (!settings_sent) {
+            scSetPtr->chkInFrames = samples_per_frame;
+            if (player_send_snapcast_setting(scSetPtr) == pdPASS) {
+              ESP_LOGI(TAG, "UDP: got settings and notified player_task "
+                       "(chkInFrames=%d)", samples_per_frame);
+            }
+            settings_sent = true;
+          }
+        }
+      }
+      free(audio);
+    }
+
+    // Store last packet for potential FEC use (not strictly needed since we
+    // decode reactively, but keep for future lookahead)
+    if (udp_last_opus_pkt) free(udp_last_opus_pkt);
+    udp_last_opus_pkt = (uint8_t *)malloc(opus_len);
+    if (udp_last_opus_pkt) {
+      memcpy(udp_last_opus_pkt, opus_data, opus_len);
+      udp_last_opus_pkt_len = opus_len;
+    }
+
+    netbuf_delete(buf);
+    buf = NULL;
+  }
+
+  if (udpOpusDecoder) {
+    opus_decoder_destroy(udpOpusDecoder);
+  }
+  ESP_LOGI(TAG, "UDP recv task exiting");
+  vTaskDelete(NULL);
+}
+
 static void http_get_task(void *pvParameters) {
   char *start;
   base_message_t base_message_rx;
@@ -505,11 +813,33 @@ static void http_get_task(void *pvParameters) {
     // do some house keeping
     {
       received_header = false;
+      clock_synced_from_server = false;
 
       timeout = FAST_SYNC_LATENCY_BUF;
 
       esp_timer_stop(timeSyncMessageTimer);
 
+      // Stop UDP task FIRST, before destroying the opus decoder it uses
+      if (udp_active) {
+        udp_active = false;
+        vTaskDelay(pdMS_TO_TICKS(100));  // let UDP task exit
+      }
+      if (t_udp_recv_task) {
+        vTaskDelete(t_udp_recv_task);
+        t_udp_recv_task = NULL;
+      }
+      if (udpNetconn) {
+        netconn_delete(udpNetconn);
+        udpNetconn = NULL;
+      }
+      if (udp_last_opus_pkt) {
+        free(udp_last_opus_pkt);
+        udp_last_opus_pkt = NULL;
+        udp_last_opus_pkt_len = 0;
+      }
+      udp_sequence_initialized = false;
+
+      // Now safe to destroy decoders
       if (opusDecoder != NULL) {
         opus_decoder_destroy(opusDecoder);
         opusDecoder = NULL;
@@ -589,8 +919,12 @@ static void http_get_task(void *pvParameters) {
     inet_pton(AF_INET, SNAPCAST_SERVER_HOST, &(servaddr.sin_addr.s_addr));
     servaddr.sin_port = htons(SNAPCAST_SERVER_PORT);
 
+#if LWIP_IPV6
     inet_pton(AF_INET, SNAPCAST_SERVER_HOST, &(remote_ip.u_addr.ip4.addr));
     remote_ip.type = IPADDR_TYPE_V4;
+#else
+    inet_pton(AF_INET, SNAPCAST_SERVER_HOST, &(remote_ip.addr));
+#endif
     remotePort = SNAPCAST_SERVER_PORT;
 
     ESP_LOGI(TAG, "try connecting to static configuration %s:%d",
@@ -648,7 +982,7 @@ static void http_get_task(void *pvParameters) {
     sprintf(mac_address, "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0],
             base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
 
-    now = esp_timer_get_time();
+    now = get_sync_time_us();
 
     // init base message
     base_message_rx.type = SNAPCAST_MESSAGE_HELLO;
@@ -738,19 +1072,19 @@ static void http_get_task(void *pvParameters) {
     while (1) {
       rc2 = netconn_recv(lwipNetconn, &firstNetBuf);
       if (rc2 != ERR_OK) {
-        if (rc2 == ERR_CONN) {
-          netconn_close(lwipNetconn);
-
-          // restart and try to reconnect
-          break;
-        }
-
         if (firstNetBuf != NULL) {
           netbuf_delete(firstNetBuf);
-
           firstNetBuf = NULL;
         }
-        continue;
+
+        if (rc2 == ERR_TIMEOUT) {
+          continue;  // timeout is recoverable, retry
+        }
+
+        // Any connection-level error: reconnect
+        ESP_LOGW(TAG, "TCP recv error %d, reconnecting", rc2);
+        netconn_close(lwipNetconn);
+        break;
       }
 
       // now parse the data
@@ -905,7 +1239,7 @@ static void http_get_task(void *pvParameters) {
                   base_message_rx.size |= (*start & 0xFF) << 24;
                   internalState = 0;
 
-                  now = esp_timer_get_time();
+                  now = get_sync_time_us();
 
                   base_message_rx.received.sec = now / 1000000;
                   base_message_rx.received.usec =
@@ -1252,6 +1586,14 @@ static void http_get_task(void *pvParameters) {
                         if (received_header == true) {
                           switch (codec) {
                             case OPUS: {
+                              // When UDP is active, skip TCP Opus decoding
+                              // (audio arrives via UDP instead)
+                              if (udp_active) {
+                                free(decoderChunk.inData);
+                                decoderChunk.inData = NULL;
+                                break;
+                              }
+
                               int frame_size = -1;
                               int samples_per_frame;
                               opus_int16 *audio = NULL;
@@ -1835,6 +2177,14 @@ static void http_get_task(void *pvParameters) {
                           }
 
                           ESP_LOGI(TAG, "Initialized opus Decoder: %d", error);
+
+                          // Set default Opus frame size (20ms) so the player
+                          // can create its PCM queue. Needed for UDP path
+                          // where TCP decode never sets chkInFrames.
+                          // Use 20ms (sr/50) matching the server's typical
+                          // chunk_ms=20 config; actual value is overridden
+                          // after first decoded packet in both TCP and UDP paths.
+                          scSet.chkInFrames = scSet.sr / 50;
                         } else if (codec == FLAC) {
                           decoderChunk.bytes = typedMsgLen;
                           decoderChunk.inData =
@@ -1916,6 +2266,98 @@ static void http_get_task(void *pvParameters) {
                         if (!esp_timer_is_active(timeSyncMessageTimer)) {
                           esp_timer_start_periodic(timeSyncMessageTimer,
                                                    timeout);
+                        }
+
+                        // Start UDP transport for audio data
+                        if (!udp_active && codec == OPUS) {
+                          // Clean up any previous UDP state
+                          if (t_udp_recv_task) {
+                            udp_active = false;
+                            vTaskDelay(pdMS_TO_TICKS(50));
+                            t_udp_recv_task = NULL;
+                          }
+                          if (udpNetconn) {
+                            netconn_delete(udpNetconn);
+                            udpNetconn = NULL;
+                          }
+                          if (udp_last_opus_pkt) {
+                            free(udp_last_opus_pkt);
+                            udp_last_opus_pkt = NULL;
+                            udp_last_opus_pkt_len = 0;
+                          }
+
+                          udpNetconn = netconn_new(NETCONN_UDP);
+                          if (udpNetconn) {
+                            int udp_rc = netconn_bind(udpNetconn, IPADDR_ANY, 0);
+                            if (udp_rc == ERR_OK) {
+                              // Send registration packet to server's UDP port
+                              // Format: 2-byte length prefix (LE) + clientId string
+                              uint16_t mac_len = strlen(mac_address);
+                              uint8_t *reg_pkt = malloc(2 + mac_len);
+                              if (reg_pkt) {
+                                reg_pkt[0] = mac_len & 0xFF;
+                                reg_pkt[1] = (mac_len >> 8) & 0xFF;
+                                memcpy(reg_pkt + 2, mac_address, mac_len);
+
+                                int udp_send_rc = netconn_connect(udpNetconn, &remote_ip, UDP_SERVER_PORT);
+                                if (udp_send_rc == ERR_OK) {
+                                  struct netbuf *reg_buf = netbuf_new();
+                                  if (reg_buf) {
+                                    netbuf_ref(reg_buf, reg_pkt, 2 + mac_len);
+                                    netconn_send(udpNetconn, reg_buf);
+                                    netbuf_delete(reg_buf);
+                                  }
+
+                                  // Disconnect so we can receive from any source
+                                  // (not strictly needed for UDP but cleaner)
+                                  // Actually keep connected so recv works as expected
+
+                                  udp_active = true;
+                                  udp_sequence_initialized = false;
+                                  udp_expected_sequence = 0;
+
+                                  // Store MAC for periodic re-registration
+                                  strncpy(udp_client_mac, mac_address, sizeof(udp_client_mac) - 1);
+                                  udp_client_mac[sizeof(udp_client_mac) - 1] = '\0';
+
+                                  // Create a snapshot of audio settings for the
+                                  // UDP task so it doesn't share scSet with the
+                                  // TCP task (which may modify volume/mute).
+                                  static snapcastSetting_t udpScSet;
+                                  udpScSet.sr = scSet.sr;
+                                  udpScSet.ch = scSet.ch;
+                                  udpScSet.bits = scSet.bits;
+                                  udpScSet.codec = scSet.codec;
+                                  udpScSet.buf_ms = scSet.buf_ms;
+                                  udpScSet.chkInFrames = scSet.chkInFrames;
+
+                                  xTaskCreatePinnedToCore(
+                                      udp_recv_task, "udp_recv",
+                                      15 * 1024,
+                                      &udpScSet, UDP_RECV_TASK_PRIORITY,
+                                      &t_udp_recv_task, UDP_RECV_TASK_CORE_ID);
+
+                                  // Free TCP opus decoder — UDP task
+                                  // has its own, saves ~30KB of RAM
+                                  if (opusDecoder != NULL) {
+                                    opus_decoder_destroy(opusDecoder);
+                                    opusDecoder = NULL;
+                                  }
+
+                                  ESP_LOGI(TAG, "UDP transport started, registered with server");
+                                } else {
+                                  ESP_LOGW(TAG, "UDP connect failed: %d, falling back to TCP", udp_send_rc);
+                                  netconn_delete(udpNetconn);
+                                  udpNetconn = NULL;
+                                }
+                                free(reg_pkt);
+                              }
+                            } else {
+                              ESP_LOGW(TAG, "UDP bind failed: %d, falling back to TCP", udp_rc);
+                              netconn_delete(udpNetconn);
+                              udpNetconn = NULL;
+                            }
+                          }
                         }
                       }
 
@@ -2325,7 +2767,29 @@ static void http_get_task(void *pvParameters) {
                           }
                         }
 
-                        player_latency_insert(tmpDiffToServer);
+                        const int64_t MAX_REASONABLE_DIFF = 30LL * 1000000LL;  // 30s
+                        if (tmpDiffToServer > MAX_REASONABLE_DIFF ||
+                            tmpDiffToServer < -MAX_REASONABLE_DIFF) {
+                          if (!clock_synced_from_server) {
+                            // Bootstrap clock using the NTP-style diff which
+                            // already accounts for round-trip time.
+                            boot_to_wall_offset_us = tmpDiffToServer;
+                            clock_synced_from_server = true;
+                            player_set_clock_offset(boot_to_wall_offset_us);
+                            ESP_LOGI(TAG,
+                                     "Clock synced from server, offset: "
+                                     "%lldus",
+                                     boot_to_wall_offset_us);
+                            reset_latency_buffer();
+                          } else {
+                            ESP_LOGW(TAG,
+                                     "Rejecting unreasonable diff to server: "
+                                     "%lldus",
+                                     tmpDiffToServer);
+                          }
+                        } else {
+                          player_latency_insert(tmpDiffToServer);
+                        }
 
                         // ESP_LOGI(TAG, "Current latency:%lld:",
                         // tmpDiffToServer);
@@ -2468,6 +2932,7 @@ void app_main(void) {
   esp_log_level_set("wifi", ESP_LOG_WARN);
   esp_log_level_set("wifi_init", ESP_LOG_WARN);
 
+#if !CONFIG_QEMU_MODE
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
   // clang-format off
@@ -2494,7 +2959,15 @@ void app_main(void) {
                        .intr_type = GPIO_INTR_DISABLE};
   gpio_config(&cfg);
 #endif
+#endif /* !CONFIG_QEMU_MODE */
 
+#if CONFIG_QEMU_MODE
+  ESP_LOGI(TAG, "QEMU mode: skipping audio board init, I2S uses stubs");
+  i2s_std_gpio_config_t i2s_pin_config0 = {0};
+  QueueHandle_t audioQHdl = xQueueCreate(1, sizeof(audioDACdata_t));
+  init_snapcast(audioQHdl);
+  init_player(i2s_pin_config0, I2S_NUM_0);
+#else
   board_i2s_pin_t pin_config0;
   get_i2s_pins(I2S_NUM_0, &pin_config0);
 
@@ -2602,8 +3075,13 @@ void app_main(void) {
 
   init_snapcast(audioQHdl);
   init_player(i2s_pin_config0, I2S_NUM_0);
+#endif /* !CONFIG_QEMU_MODE */
 
-#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
+#if CONFIG_ETH_USE_OPENETH
+  /* QEMU OpenCores Ethernet path */
+  eth_init();
+  init_http_server_task("ETH_DEF");
+#elif CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
   eth_init();
   // pass "WIFI_STA_DEF", "WIFI_AP_DEF", "ETH_DEF"
@@ -2659,12 +3137,14 @@ void app_main(void) {
 
   while(1) {
     if (xQueueReceive(audioQHdl, &dac_data, portMAX_DELAY) == pdTRUE) {
+#if !CONFIG_QEMU_MODE
       if (dac_data.mute != dac_data_old.mute){
         audio_hal_set_mute(board_handle->audio_hal, dac_data.mute);
       }
       if (dac_data.volume != dac_data_old.volume){
         audio_hal_set_volume(board_handle->audio_hal, dac_data.volume);
       }
+#endif
       dac_data_old = dac_data;
     }
   }

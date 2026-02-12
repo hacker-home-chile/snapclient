@@ -1,4 +1,13 @@
 menu "Snapclient Configuration"
+    config QEMU_MODE
+        bool "QEMU emulation mode"
+        default false
+        help
+            Enable QEMU emulation mode. When enabled, I2S audio output is
+            stubbed (data is discarded at real-time rate) and OpenCores
+            Ethernet is used instead of WiFi or hardware Ethernet.
+            Use this when running the firmware in ESP32 QEMU.
+
     config SNAPSERVER_USE_MDNS
         bool "Use mDNS"
         default true

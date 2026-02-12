@@ -646,8 +646,9 @@ int dsp_processor_worker(char *audio, size_t chunk_size, uint32_t samplerate) {
  */
 void dsp_processor_set_volome(double volume) {
   if (volume >= 0 && volume <= 1.0) {
-    ESP_LOGI(TAG, "Set volume to %f", volume);
-    dynamic_vol = volume;
+    double max_vol = CONFIG_SNAPCLIENT_MAX_VOLUME_PERCENT / 100.0;
+    dynamic_vol = volume * max_vol;
+    ESP_LOGI(TAG, "Set volume to %f (capped to %f)", volume, dynamic_vol);
   }
 }
 #endif

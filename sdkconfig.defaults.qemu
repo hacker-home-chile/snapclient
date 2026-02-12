@@ -1,0 +1,44 @@
+# QEMU-specific sdkconfig overlay
+# Usage: idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.qemu" build
+
+# --- QEMU mode flag ---
+CONFIG_QEMU_MODE=y
+
+# --- Networking: use OpenCores Ethernet (QEMU built-in) ---
+CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET=n
+CONFIG_SNAPCLIENT_USE_SPI_ETHERNET=n
+CONFIG_ETH_USE_OPENETH=y
+
+# --- Disable WiFi (not emulated in QEMU) ---
+CONFIG_ESP_WIFI_ENABLED=n
+
+# --- Server connection: direct IP (no mDNS in QEMU) ---
+CONFIG_SNAPSERVER_USE_MDNS=n
+CONFIG_SNAPSERVER_HOST="10.0.2.2"
+CONFIG_SNAPSERVER_PORT=1704
+
+# --- Client identity ---
+CONFIG_SNAPCLIENT_NAME="QEMU-Snapclient"
+
+# --- Disable components not available/needed in QEMU ---
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+
+# --- Use sample insertion sync (no APLL in QEMU) ---
+CONFIG_USE_SAMPLE_INSERTION=y
+
+# --- Partition table: use project's custom table (has storage partition) ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- Flash: 4MB to match partition table ---
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# --- Reduce build time: disable unused features ---
+CONFIG_BT_ENABLED=n
+CONFIG_LWIP_IPV6=n
+
+# --- Memory optimizations for QEMU (virtual loopback network) ---
+# TCP send buffer: 5840 (4x MSS) instead of default 11680 (8x MSS).
+# QEMU's SLiRP has ~0 latency so a large send window is unnecessary.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5840
+CONFIG_LWIP_TCP_WND_DEFAULT=5840

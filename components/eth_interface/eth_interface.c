@@ -22,6 +22,9 @@
 #if CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
 #include "driver/spi_master.h"
 #endif
+#if CONFIG_ETH_USE_OPENETH
+#include "esp_eth_mac.h"
+#endif
 
 static const char *TAG = "snapclient_eth_init";
 
@@ -275,6 +278,40 @@ err:
 }
 #endif  // CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
 
+#if CONFIG_ETH_USE_OPENETH
+/**
+ * @brief OpenCores Ethernet init for QEMU emulation.
+ * No PHY configuration needed — QEMU provides a virtual MAC directly.
+ */
+static esp_eth_handle_t eth_init_openeth(void) {
+  esp_eth_handle_t ret = NULL;
+
+  eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+  eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+  phy_config.autonego_timeout_ms = 100;
+
+  esp_eth_mac_t *mac = esp_eth_mac_new_openeth(&mac_config);
+  esp_eth_phy_t *phy = esp_eth_phy_new_dp83848(&phy_config);
+
+  esp_eth_handle_t eth_handle = NULL;
+  esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
+  ESP_GOTO_ON_FALSE(esp_eth_driver_install(&config, &eth_handle) == ESP_OK,
+                    NULL, err, TAG, "OpenCores Ethernet driver install failed");
+  return eth_handle;
+err:
+  if (eth_handle != NULL) {
+    esp_eth_driver_uninstall(eth_handle);
+  }
+  if (mac != NULL) {
+    mac->del(mac);
+  }
+  if (phy != NULL) {
+    phy->del(phy);
+  }
+  return ret;
+}
+#endif /* CONFIG_ETH_USE_OPENETH */
+
 /** Original init function in the example */
 esp_err_t original_eth_init(esp_eth_handle_t *eth_handles_out[],
                             uint8_t *eth_cnt_out) {
@@ -282,7 +319,19 @@ esp_err_t original_eth_init(esp_eth_handle_t *eth_handles_out[],
   esp_eth_handle_t *eth_handles = NULL;
   uint8_t eth_cnt = 0;
 
-#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
+#if CONFIG_ETH_USE_OPENETH
+  /* QEMU OpenCores Ethernet — single virtual interface, no PHY config */
+  ESP_GOTO_ON_FALSE(
+      eth_handles_out != NULL && eth_cnt_out != NULL, ESP_ERR_INVALID_ARG, err,
+      TAG, "invalid arguments");
+  eth_handles = calloc(1, sizeof(esp_eth_handle_t));
+  ESP_GOTO_ON_FALSE(eth_handles != NULL, ESP_ERR_NO_MEM, err, TAG, "no memory");
+  eth_handles[0] = eth_init_openeth();
+  ESP_GOTO_ON_FALSE(eth_handles[0], ESP_FAIL, err, TAG,
+                    "OpenCores Ethernet init failed");
+  eth_cnt = 1;
+  ESP_LOGI(TAG, "OpenCores Ethernet initialized (QEMU mode)");
+#elif CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
   ESP_GOTO_ON_FALSE(
       eth_handles_out != NULL && eth_cnt_out != NULL, ESP_ERR_INVALID_ARG, err,
@@ -336,13 +385,13 @@ esp_err_t original_eth_init(esp_eth_handle_t *eth_handles_out[],
 #endif  // CONFIG_ETH_USE_SPI_ETHERNET
 #else
   ESP_LOGD(TAG, "no Ethernet device selected to init");
-#endif  // CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET ||
+#endif  // CONFIG_ETH_USE_OPENETH || CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET ||
         // CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
   *eth_handles_out = eth_handles;
   *eth_cnt_out = eth_cnt;
 
   return ret;
-#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
+#if CONFIG_ETH_USE_OPENETH || CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
 err:
   free(eth_handles);

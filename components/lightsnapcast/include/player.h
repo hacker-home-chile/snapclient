@@ -80,6 +80,7 @@ int32_t reset_latency_buffer(void);
 int32_t latency_buffer_full(bool *is_full, TickType_t wait);
 int32_t get_diff_to_server(int64_t *tDiff);
 int32_t server_now(int64_t *sNow, int64_t *diff2Server);
+void player_set_clock_offset(int64_t offset_us);
 
 int32_t pcm_chunk_queue_msg_waiting(void);
 #ifdef __cplusplus

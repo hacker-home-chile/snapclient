@@ -29,12 +29,85 @@
 #include "player.h"
 #include "snapcast.h"
 
+#ifdef CONFIG_QEMU_MODE
+/*
+ * QEMU I2S stubs: the full decode/DSP pipeline runs, but audio data is
+ * discarded at the I2S boundary.  DMA timing is approximated with vTaskDelay
+ * so that flow-control and sync logic still exercise realistic code paths.
+ */
+static int qemu_i2s_dummy_handle_val;
+static i2s_chan_handle_t qemu_i2s_dummy_handle =
+    (i2s_chan_handle_t)&qemu_i2s_dummy_handle_val;
+
+static esp_err_t qemu_i2s_new_channel(const i2s_chan_config_t *cfg,
+                                       i2s_chan_handle_t *tx,
+                                       i2s_chan_handle_t *rx) {
+  if (tx) *tx = qemu_i2s_dummy_handle;
+  return ESP_OK;
+}
+
+static esp_err_t qemu_i2s_channel_init_std(i2s_chan_handle_t h,
+                                            const i2s_std_config_t *c) {
+  return ESP_OK;
+}
+
+static esp_err_t qemu_i2s_channel_enable(i2s_chan_handle_t h) {
+  return ESP_OK;
+}
+
+static esp_err_t qemu_i2s_channel_disable(i2s_chan_handle_t h) {
+  return ESP_OK;
+}
+
+static esp_err_t qemu_i2s_del_channel(i2s_chan_handle_t h) {
+  return ESP_OK;
+}
+
+static esp_err_t qemu_i2s_channel_write(i2s_chan_handle_t handle,
+                                         const void *src, size_t size,
+                                         size_t *bytes_written,
+                                         TickType_t ticks_to_wait) {
+  /* Simulate real-time consumption: 48kHz * 2ch * 2bytes = 192000 bytes/sec */
+  uint32_t delay_us = (size * 1000000ULL) / 192000;
+  if (delay_us > 1000) {
+    vTaskDelay(pdMS_TO_TICKS(delay_us / 1000));
+  }
+  if (bytes_written) {
+    *bytes_written = size;
+  }
+  return ESP_OK;
+}
+
+static esp_err_t qemu_i2s_channel_preload_data(i2s_chan_handle_t handle,
+                                                const void *src, size_t size,
+                                                size_t *bytes_loaded) {
+  if (bytes_loaded) {
+    *bytes_loaded = size;
+  }
+  return ESP_OK;
+}
+
+#define i2s_new_channel     qemu_i2s_new_channel
+#define i2s_channel_init_std_mode qemu_i2s_channel_init_std
+#define i2s_channel_enable  qemu_i2s_channel_enable
+#define i2s_channel_disable qemu_i2s_channel_disable
+#define i2s_del_channel     qemu_i2s_del_channel
+#define i2s_channel_write   qemu_i2s_channel_write
+#define i2s_channel_preload_data qemu_i2s_channel_preload_data
+#endif /* CONFIG_QEMU_MODE */
+
 #define USE_SAMPLE_INSERTION CONFIG_USE_SAMPLE_INSERTION
 
 #define SYNC_TASK_PRIORITY (configMAX_PRIORITIES - 1)
 #define SYNC_TASK_CORE_ID 1  // tskNO_AFFINITY
 
 static const char *TAG = "PLAYER";
+
+// Clock offset from boot time to wall-clock time, set by main via
+// player_set_clock_offset() after syncing with the server.
+static int64_t clock_offset_us = 0;
+
+void player_set_clock_offset(int64_t offset_us) { clock_offset_us = offset_us; }
 
 #if USE_SAMPLE_INSERTION
 
@@ -653,7 +726,7 @@ int32_t server_now(int64_t *sNow, int64_t *diff2Server) {
     return -2;
   }
 
-  now = esp_timer_get_time();
+  now = esp_timer_get_time() + clock_offset_us;
 
   if (get_diff_to_server(&diff) == -1) {
     // ESP_LOGW(TAG,
@@ -1208,6 +1281,7 @@ static void player_task(void *pvParameters) {
   int64_t outputBufferDacTime_us = 0;
   int64_t dmaDescDuration_us = 0;
   size_t alreadyWritten = 0;
+  int hardResyncCount = 0;
 
   memset(&scSet, 0, sizeof(snapcastSetting_t));
 
@@ -1373,6 +1447,21 @@ static void player_task(void *pvParameters) {
         }
 
         if (age < 0) {  // get initial sync using hardware timer
+          // Sanity check: if age is unreasonably far in the future,
+          // the time sync is likely corrupted. Reset and retry.
+          if (-age > (buf_us + 5000000LL)) {  // buf_us + 5 seconds max
+            ESP_LOGW(TAG,
+                     "Initial sync age unreasonable: %lldus, resetting "
+                     "latency buffer",
+                     age);
+            reset_latency_buffer();
+            if (chnk != NULL) {
+              free_pcm_chunk(chnk);
+              chnk = NULL;
+            }
+            continue;
+          }
+
           bool dmaFull = false;
 
           MEDIANFILTER_Init(&shortMedianFilter);
@@ -1389,14 +1478,13 @@ static void player_task(void *pvParameters) {
             if (chnk == NULL) {
               if (pcmChkQHdl != NULL) {
                 ret = xQueueReceive(pcmChkQHdl, &chnk, pdMS_TO_TICKS(100));
-                // if (ret != pdFAIL) {
-                //   ESP_LOGI(TAG, "got pcm chunk with size %d",
-                //            chnk->fragment->size);
-                // }
+                if (ret == pdFAIL) {
+                  continue;  // queue empty, wait for audio data
+                }
+              } else {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;  // queue not ready yet
               }
-            } else {
-              // ESP_LOGI(TAG, "got pcm chunk with size %d",
-              // chnk->fragment->size);
             }
 
             fragment = chnk->fragment;
@@ -1498,6 +1586,16 @@ static void player_task(void *pvParameters) {
                    age, diff2Server, heap_caps_get_free_size(MALLOC_CAP_32BIT),
                    heap_caps_get_largest_free_block(MALLOC_CAP_32BIT), ap.rssi);
 
+          // Flush remaining stale chunks to free memory
+          {
+            pcm_chunk_message_t *stale = NULL;
+            while (xQueueReceive(pcmChkQHdl, &stale, 0) == pdPASS) {
+              free_pcm_chunk(stale);
+            }
+          }
+
+          reset_latency_buffer();
+
           dir = 0;
 
           insertedSamplesCounter = 0;
@@ -1514,7 +1612,9 @@ static void player_task(void *pvParameters) {
 
       const int64_t shortOffset = SHORT_OFFSET;  // µs, softsync
       const int64_t miniOffset = MINI_OFFSET;    // µs, softsync
-      const int64_t hardResyncThreshold = 2000;  // µs, hard sync
+      // Graduated resync thresholds (in µs)
+      const int64_t softResyncThreshold = 5000;    // batch sample correction (5-50ms)
+      const int64_t hardResyncThreshold = 50000;   // hard resync (>50ms, last resort)
 
       if (initialSync == 1) {
         if (size == 0) {
@@ -1656,72 +1756,160 @@ static void player_task(void *pvParameters) {
 
           int msgWaiting = uxQueueMessagesWaiting(pcmChkQHdl);
 
-          // resync hard if we are getting very late / early.
-          // rest gets tuned in through apll speed control or sample insertion
-          if ((msgWaiting == 0) ||
-              (MEDIANFILTER_isFull(&shortMedianFilter, 0) &&
-               ((shortMedian > hardResyncThreshold) ||
-                (shortMedian < -hardResyncThreshold)))) {
-            if (chnk != NULL) {
-              free_pcm_chunk(chnk);
-              chnk = NULL;
+          int64_t absDrift = shortMedian < 0 ? -shortMedian : shortMedian;
+
+          // Queue empty: write silence for one chunk instead of hard resync
+          // This handles brief WiFi hiccups without disrupting playback
+          if (msgWaiting == 0) {
+            if (absDrift < hardResyncThreshold) {
+              // Soft handling: write silence for one chunk duration
+              size_t silence_bytes = chunkDuration_us * scSet.sr / 1000000 *
+                                     (scSet.bits >> 3) * scSet.ch;
+              if (silence_bytes > 0 && silence_bytes <= 8192) {
+                uint8_t *silence = calloc(1, silence_bytes);
+                if (silence) {
+                  size_t written_silence = 0;
+                  i2s_channel_write(tx_chan, silence, silence_bytes,
+                                    &written_silence, portMAX_DELAY);
+                  free(silence);
+                }
+              }
+              ESP_LOGW(TAG, "SOFT RESYNC: queue empty, wrote silence (drift %lldus)", shortMedian);
+              continue;
             }
-
-            wifi_ap_record_t ap;
-            esp_wifi_sta_get_ap_info(&ap);
-
-            ESP_LOGW(TAG,
-                     "RESYNCING HARD 2: age %lldus, latency %lldus, free "
-                     "%d, largest block %d, %d, rssi: %d",
-                     age, diff2Server,
-                     heap_caps_get_free_size(MALLOC_CAP_32BIT),
-                     heap_caps_get_largest_free_block(MALLOC_CAP_32BIT),
-                     msgWaiting, ap.rssi);
-
-            my_gptimer_stop(gptimer);
-
-            audio_set_mute(true);
-
-            my_i2s_channel_disable(tx_chan);
-
-            initialSync = 0;
-
-            insertedSamplesCounter = 0;
-
-            continue;
+            // else fall through to hard resync below
           }
 
-#if USE_SAMPLE_INSERTION  // insert samples to adjust sync
-          if ((enableControlLoop == true) &&
-              (MEDIANFILTER_isFull(&shortMedianFilter, 0))) {
-            if ((shortMedian < -shortOffset) && (miniMedian < -miniOffset) &&
-                (age < -miniOffset)) {  // we are early
-              dir = -1;
-              dir_insert_sample = -1;
-              insertedSamplesCounter += INSERT_SAMPLES;
-            } else if ((shortMedian > shortOffset) &&
-                       (miniMedian > miniOffset) &&
-                       (age > miniOffset)) {  // we are late
-              dir = 1;
-              dir_insert_sample = 1;
-              insertedSamplesCounter -= INSERT_SAMPLES;
-            }
-          }
-#else  // use APLL to adjust sync
-          if ((enableControlLoop == true) &&
-              (MEDIANFILTER_isFull(&shortMedianFilter, 0))) {
-            if ((shortMedian < -shortOffset) && (miniMedian < -miniOffset) &&
-                (age < -miniOffset)) {  // we are early
-              dir = -1;
-            } else if ((shortMedian > shortOffset) &&
-                       (miniMedian > miniOffset) &&
-                       (age > miniOffset)) {  // we are late
-              dir = 1;
-            }
+          // Graduated resync based on drift magnitude
+          if (MEDIANFILTER_isFull(&shortMedianFilter, 0)) {
+            if (absDrift > hardResyncThreshold) {
+              // HARD RESYNC: drift too large, must fully resync
+              if (chnk != NULL) {
+                free_pcm_chunk(chnk);
+                chnk = NULL;
+              }
 
-            adjust_apll(dir);
-          }
+              // Flush stale chunks from queue so initial sync
+              // starts with fresh data (prevents resync loop)
+              {
+                pcm_chunk_message_t *stale = NULL;
+                while (xQueueReceive(pcmChkQHdl, &stale, 0) == pdPASS) {
+                  free_pcm_chunk(stale);
+                }
+              }
+
+              wifi_ap_record_t ap;
+              esp_wifi_sta_get_ap_info(&ap);
+
+              ESP_LOGW(TAG,
+                       "RESYNCING HARD 2: age %lldus, latency %lldus, free "
+                       "%d, largest block %d, %d, rssi: %d",
+                       age, diff2Server,
+                       heap_caps_get_free_size(MALLOC_CAP_32BIT),
+                       heap_caps_get_largest_free_block(MALLOC_CAP_32BIT),
+                       msgWaiting, ap.rssi);
+
+              my_gptimer_stop(gptimer);
+
+              audio_set_mute(true);
+
+              my_i2s_channel_disable(tx_chan);
+
+              reset_latency_buffer();
+              MEDIANFILTER_Init(&shortMedianFilter);
+              MEDIANFILTER_Init(&miniMedianFilter);
+
+              hardResyncCount++;
+              if (hardResyncCount > 5) {
+                ESP_LOGW(TAG,
+                         "CIRCUIT BREAKER: %d consecutive hard resyncs, "
+                         "forcing fresh time sync",
+                         hardResyncCount);
+              }
+
+              initialSync = 0;
+
+              insertedSamplesCounter = 0;
+
+              continue;
+            } else if (absDrift > softResyncThreshold) {
+              // ONE-SHOT RESYNC: directly inject silence or drop chunks
+              // instead of using the slow sample-insertion mechanism.
+              if (age < 0) {
+                // EARLY: pad silence into I2S to delay playback
+                int64_t pad_us = -age;
+                size_t pad_bytes = (size_t)(pad_us * scSet.sr / 1000000) *
+                                   (scSet.bits >> 3) * scSet.ch;
+                // Cap at 100ms to avoid blocking too long
+                size_t max_pad = (size_t)(scSet.sr / 10) *
+                                 (scSet.bits >> 3) * scSet.ch;
+                if (pad_bytes > max_pad) pad_bytes = max_pad;
+
+                ESP_LOGW(TAG, "ONE-SHOT PAD: age %lldus, writing %d bytes silence",
+                         age, pad_bytes);
+
+                uint8_t *silence = calloc(1, pad_bytes);
+                if (silence) {
+                  size_t written_pad = 0;
+                  i2s_channel_write(tx_chan, silence, pad_bytes,
+                                    &written_pad, portMAX_DELAY);
+                  free(silence);
+                }
+              } else {
+                // LATE: drop chunks from queue to catch up
+                int64_t drop_us = age;
+                int chunks_to_drop = (int)(drop_us / chunkDuration_us);
+                if (chunks_to_drop < 1) chunks_to_drop = 1;
+
+                ESP_LOGW(TAG, "ONE-SHOT DROP: age %lldus, dropping %d chunks",
+                         age, chunks_to_drop);
+
+                pcm_chunk_message_t *drop = NULL;
+                for (int i = 0; i < chunks_to_drop; i++) {
+                  if (xQueueReceive(pcmChkQHdl, &drop, 0) == pdPASS) {
+                    free_pcm_chunk(drop);
+                  } else {
+                    break;
+                  }
+                }
+              }
+              // Reset filters so subsequent reads use fresh data
+              MEDIANFILTER_Init(&shortMedianFilter);
+              MEDIANFILTER_Init(&miniMedianFilter);
+            } else {
+              // Normal fine-tune control (existing logic for small drift)
+              hardResyncCount = 0;
+#if USE_SAMPLE_INSERTION
+              if ((enableControlLoop == true)) {
+                if ((shortMedian < -shortOffset) && (miniMedian < -miniOffset) &&
+                    (age < -miniOffset)) {  // we are early
+                  dir = -1;
+                  dir_insert_sample = -1;
+                  insertedSamplesCounter += INSERT_SAMPLES;
+                } else if ((shortMedian > shortOffset) &&
+                           (miniMedian > miniOffset) &&
+                           (age > miniOffset)) {  // we are late
+                  dir = 1;
+                  dir_insert_sample = 1;
+                  insertedSamplesCounter -= INSERT_SAMPLES;
+                }
+              }
+#else
+              if ((enableControlLoop == true)) {
+                if ((shortMedian < -shortOffset) && (miniMedian < -miniOffset) &&
+                    (age < -miniOffset)) {  // we are early
+                  dir = -1;
+                } else if ((shortMedian > shortOffset) &&
+                           (miniMedian > miniOffset) &&
+                           (age > miniOffset)) {  // we are late
+                  dir = 1;
+                }
+
+                adjust_apll(dir);
+              }
 #endif
+            }
+          }
 
           //        ESP_LOGI(TAG, "%d, %lldus, %lldus, %lldus, q:%d, %lld,
           //        %llu", dir, age,
@@ -1766,19 +1954,34 @@ static void player_task(void *pvParameters) {
       usec = usec % 1000;
 
       if (pcmChkQHdl != NULL) {
-        ESP_LOGV(TAG,
-                 "Couldn't get PCM chunk, recv: messages waiting %d, "
+        ESP_LOGW(TAG,
+                 "Couldn't get PCM chunk (queue timeout), messages waiting %d, "
                  "diff2Server: %llds, %lld.%lldms",
                  uxQueueMessagesWaiting(pcmChkQHdl), sec, msec, usec);
       }
 
-      dir = 0;
-
-      initialSync = 0;
-
-      audio_set_mute(true);
-
-      my_i2s_channel_disable(tx_chan);
+      // Write silence to I2S instead of immediately hard resyncing.
+      // This keeps the I2S DMA flowing and avoids a pop/click on resume.
+      if (initialSync == 1 && i2sEnabled && scSet.sr > 0) {
+        size_t silence_bytes = chunkDuration_us * scSet.sr / 1000000 *
+                               (scSet.bits >> 3) * scSet.ch;
+        if (silence_bytes > 0 && silence_bytes <= 8192) {
+          uint8_t *silence = calloc(1, silence_bytes);
+          if (silence) {
+            size_t written_silence = 0;
+            i2s_channel_write(tx_chan, silence, silence_bytes,
+                              &written_silence, portMAX_DELAY);
+            free(silence);
+          }
+        }
+        ESP_LOGW(TAG, "Wrote silence chunk to I2S (waiting for data)");
+      } else {
+        // No initial sync established yet, do full reset
+        dir = 0;
+        initialSync = 0;
+        audio_set_mute(true);
+        my_i2s_channel_disable(tx_chan);
+      }
     }
   }
 }
