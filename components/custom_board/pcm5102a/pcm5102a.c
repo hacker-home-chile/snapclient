@@ -12,7 +12,9 @@
 #include "board.h"
 #include "esp_log.h"
 
+#if CONFIG_PCM5102A_MUTE_PIN >= 0
 static const char *TAG = "PCM5102A";
+#endif
 
 #define PCM5102A_ASSERT(a, format, b, ...) \
   if ((a) != 0) {                          \
@@ -38,13 +40,12 @@ audio_hal_func_t AUDIO_CODEC_PCM5102A_DEFAULT_HANDLE = {
 };
 
 esp_err_t pcm5102a_init(audio_hal_codec_config_t *codec_cfg) {
+#if CONFIG_PCM5102A_MUTE_PIN < 0
+  (void)codec_cfg;
+  return ESP_OK;
+#else
   esp_err_t ret;
-
   gpio_config_t io_conf;
-
-  if (CONFIG_PCM5102A_MUTE_PIN < 0) {
-    return ESP_OK;
-  }
 
   io_conf.intr_type = GPIO_INTR_DISABLE;
   io_conf.mode = GPIO_MODE_OUTPUT;
@@ -62,6 +63,7 @@ esp_err_t pcm5102a_init(audio_hal_codec_config_t *codec_cfg) {
   }
 
   return ret;
+#endif
 }
 
 esp_err_t pcm5102a_set_volume(int vol) { return ESP_OK; }
