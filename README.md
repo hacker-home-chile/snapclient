@@ -217,7 +217,7 @@ Android : snapclient from the app play store
 Update your client(s) over the air.
 
 >Note:<br>
->In commits 98c439dbd040f04848a017c594b29ba76d6bd261 and 4fcf3a6abf88f549966c92645eb6fa8073b81d63 the partition table has been altered,
+>In commits [98c439d](https://github.com/CarlosDerSeher/snapclient/commit/98c439d) and [4fcf3a6](https://github.com/CarlosDerSeher/snapclient/commit/4fcf3a6) the partition table has been altered,
 so there is a chance that systems running versions of the Firmware < v0.0.3 will encounter troubles during OTA upgrade. In tests we found OTA
 works without any issues but it hasn't been tested for every possible hardware combination. So be prepared to flash using serial connection if
 something goes sideways.
