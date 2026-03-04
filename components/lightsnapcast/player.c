@@ -504,7 +504,7 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_) {
   MEDIANFILTER_Init(&miniMedianFilter);
   
   #if CONFIG_PM_ENABLE
-  esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "player", &player_pm_lock_handle);
+  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "player", &player_pm_lock_handle);
   #endif
 
   ESP_LOGI(TAG, "init player done");
@@ -570,7 +570,7 @@ int start_player(snapcastSetting_t *setting) {
 
   ESP_LOGI(TAG, "Start player_task");
 
-  xTaskCreatePinnedToCore(player_task, "player", 2048 + 512, NULL,
+  xTaskCreatePinnedToCore(player_task, "player", 1024 * 3, NULL,
                           SYNC_TASK_PRIORITY, &playerTaskHandle,
                           SYNC_TASK_CORE_ID);
 
@@ -964,7 +964,7 @@ esp_err_t my_gptimer_start(gptimer_handle_t timer) {
 }
 
 static void tg0_timer_deinit(void) {
-  //	timer_deinit(TIMER_GROUP_1, TIMER_1);
+  //  timer_deinit(TIMER_GROUP_1, TIMER_1);
   if (gptimer) {
     ESP_ERROR_CHECK(my_gptimer_stop(gptimer));
     ESP_ERROR_CHECK(gptimer_del_timer(gptimer));
@@ -1442,7 +1442,8 @@ static void player_task(void *pvParameters) {
   size_t alreadyWritten = 0;
   static uint32_t queueCreatedWithChkInFrames = UINT32_MAX;
   int64_t playback_start_time_us = 0;
-  uint64_t samples_written = 0;
+  uint64_t samples_written = 0;  
+  UBaseType_t uxHighWaterMark;
 
   memset(&scSet, 0, sizeof(snapcastSetting_t));
   player_get_snapcast_settings(&scSet);
@@ -1497,6 +1498,8 @@ static void player_task(void *pvParameters) {
   }
 
   while (1) {
+    //ESP_LOGD(TAG, "HIGH: %u", uxTaskGetStackHighWaterMark( NULL ));
+    
     // ESP_LOGW( TAG, "32b f %d b %d", heap_caps_get_free_size
     //(MALLOC_CAP_8BIT), heap_caps_get_largest_free_block (MALLOC_CAP_8BIT));
     // ESP_LOGW (TAG, "stack free: %d", uxTaskGetStackHighWaterMark(NULL));
@@ -1855,7 +1858,7 @@ static void player_task(void *pvParameters) {
 
               // #if USE_SAMPLE_INSERTION
               //               if (dir_insert_sample < 0) {
-              //         	  tmpSize -= sampleSizeInBytes;
+              //            tmpSize -= sampleSizeInBytes;
               //               }
               // #endif
 
@@ -2070,15 +2073,15 @@ static void player_task(void *pvParameters) {
           //         age, shortMedian, miniMedian,
           //         uxQueueMessagesWaiting(pcmChkQHdl));
           // ESP_LOGI( TAG, "8b f %d b %d",
-          // 		   heap_caps_get_free_size(MALLOC_CAP_8BIT |
-          //           						   MALLOC_CAP_INTERNAL),
+          //       heap_caps_get_free_size(MALLOC_CAP_8BIT |
+          //                         MALLOC_CAP_INTERNAL),
           //           heap_caps_get_largest_free_block(MALLOC_CAP_8BIT |
           //                                            MALLOC_CAP_INTERNAL));
           // ESP_LOGI( TAG, "32b f %d b %d",
           //           heap_caps_get_free_size(MALLOC_CAP_32BIT |
           //                                   MALLOC_CAP_EXEC),
           //           heap_caps_get_largest_free_block(MALLOC_CAP_32BIT |
-          //		 MALLOC_CAP_EXEC));
+          //     MALLOC_CAP_EXEC));
         } else {
           // ESP_LOGW(TAG, "couldn't get server now");
 
@@ -2139,3 +2142,4 @@ static void player_task(void *pvParameters) {
   playerTaskHandle = NULL;
   vTaskDelete(NULL);
 }
+
