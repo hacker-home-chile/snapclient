@@ -504,7 +504,7 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_) {
   MEDIANFILTER_Init(&miniMedianFilter);
   
   #if CONFIG_PM_ENABLE
-  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "player", &player_pm_lock_handle);
+  esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "player", &player_pm_lock_handle);
   #endif
 
   ESP_LOGI(TAG, "init player done");
