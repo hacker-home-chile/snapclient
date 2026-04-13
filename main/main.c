@@ -175,14 +175,37 @@ static inline int64_t get_sync_time_us(void) {
 #define UDP_RECV_TASK_CORE_ID tskNO_AFFINITY
 #define UDP_RECV_BUF_SIZE 2048
 
+// Jitter / reorder buffer. Packets are parked here briefly so that late or
+// out-of-order datagrams can be placed back into sequence before the Opus
+// decoder sees them. The decoder depends on in-order feed for best quality,
+// and the player task wants monotonically advancing timestamps.
+#define UDP_REORDER_SIZE 6        // 6 slots × ~20ms = 120ms reorder window
+#define UDP_MAX_OPUS_LEN 1024     // plenty for typical Opus bitrates up to ~400kbps
+#define UDP_JITTER_HOLD_MS 40     // give up waiting for a missing slot after this
+
+typedef struct udp_reorder_slot {
+  bool filled;
+  uint16_t seq;
+  int32_t ts_sec;
+  int32_t ts_usec;
+  uint32_t opus_len;
+  TickType_t arrival;
+  uint8_t opus_data[UDP_MAX_OPUS_LEN];
+} udp_reorder_slot_t;
+
 static struct netconn *udpNetconn = NULL;
 static TaskHandle_t t_udp_recv_task = NULL;
 static volatile bool udp_active = false;
-static uint16_t udp_expected_sequence = 0;
-static bool udp_sequence_initialized = false;
-// Cached last opus packet data + length for FEC decoding
-static uint8_t *udp_last_opus_pkt = NULL;
-static uint32_t udp_last_opus_pkt_len = 0;
+
+static udp_reorder_slot_t *udp_reorder_buf = NULL;  // heap-allocated in task
+static uint16_t udp_reorder_next_seq = 0;
+static bool udp_reorder_initialized = false;
+
+// Pre-allocated scratch buffer used by the Opus decode helper, sized to
+// accommodate the worst-case Opus frame (60ms stereo 16-bit @ 48kHz ≈ 11.5KB).
+// Allocated once at task start so the hot path stays free of malloc/free.
+#define UDP_DECODE_SCRATCH_BYTES 16384
+static opus_int16 *udp_decode_scratch = NULL;
 
 static char udp_client_mac[18];  // MAC address for UDP re-registration
 
@@ -492,8 +515,181 @@ void audio_set_volume(int volume) {
  *
  */
 /**
+ * Decode one Opus packet and push the resulting PCM chunk (plus any PLC/FEC
+ * recovery frames) into the player queue. `scratch` is a caller-owned int16
+ * buffer large enough to hold the decoded samples for a single frame; the
+ * helper reuses it for PLC, FEC and normal decode paths so no malloc happens
+ * in the hot path.
+ */
+static void udp_decode_and_insert(OpusDecoder *dec,
+                                   snapcastSetting_t *scSet,
+                                   opus_int16 *scratch,
+                                   size_t scratch_bytes,
+                                   const uint8_t *opus_data,
+                                   uint32_t opus_len,
+                                   int32_t ts_sec,
+                                   int32_t ts_usec,
+                                   uint16_t gap,
+                                   uint32_t *pkts_decoded,
+                                   uint32_t *pkts_fec_recovered) {
+  int samples_per_frame = opus_packet_get_samples_per_frame(opus_data, scSet->sr);
+  if (samples_per_frame <= 0) return;
+
+  size_t pcm_bytes = (size_t)samples_per_frame * (scSet->ch * scSet->bits >> 3);
+  if (pcm_bytes == 0 || pcm_bytes > scratch_bytes) return;
+
+  int64_t chunk_dur_us = 1000000LL * samples_per_frame / scSet->sr;
+  int64_t base_ts = (int64_t)ts_sec * 1000000LL + ts_usec;
+
+  // PLC for packets lost earlier in the gap (all but the most recent).
+  // Cap at 3 to avoid runaway recovery on large gaps.
+  if (gap > 1) {
+    uint16_t plc_frames = gap - 1;
+    if (plc_frames > 3) plc_frames = 3;
+    for (uint16_t i = 0; i < plc_frames; i++) {
+      int plc_size = opus_decode(dec, NULL, 0, scratch, samples_per_frame, 0);
+      if (plc_size <= 0) continue;
+      pcm_chunk_message_t *plc_chunk = NULL;
+      if (allocate_pcm_chunk_memory(&plc_chunk, pcm_bytes) < 0) continue;
+      int64_t plc_ts = base_ts - (int64_t)(gap - i) * chunk_dur_us;
+      plc_chunk->timestamp.sec = plc_ts / 1000000LL;
+      plc_chunk->timestamp.usec = plc_ts % 1000000LL;
+      if (plc_chunk->fragment->payload) {
+        uint32_t cnt = 0;
+        for (int j = 0; j < (int)pcm_bytes; j += 4) {
+          volatile uint32_t *sample = (volatile uint32_t *)(&plc_chunk->fragment->payload[j]);
+          uint32_t tmpData = (((uint32_t)scratch[cnt] << 16) & 0xFFFF0000) |
+                             (((uint32_t)scratch[cnt + 1] << 0) & 0x0000FFFF);
+          *sample = (volatile uint32_t)tmpData;
+          cnt += 2;
+        }
+      }
+      insert_pcm_chunk(plc_chunk);
+    }
+  }
+
+  // FEC-decode the most recent lost packet from side information in the
+  // current packet (Opus in-band FEC).
+  if (gap > 0) {
+    int fec_size = opus_decode(dec, opus_data, opus_len, scratch, samples_per_frame, 1);
+    if (fec_size > 0) {
+      pcm_chunk_message_t *fec_chunk = NULL;
+      if (allocate_pcm_chunk_memory(&fec_chunk, pcm_bytes) >= 0) {
+        int64_t fec_ts = base_ts - chunk_dur_us;
+        fec_chunk->timestamp.sec = fec_ts / 1000000LL;
+        fec_chunk->timestamp.usec = fec_ts % 1000000LL;
+        if (fec_chunk->fragment->payload) {
+          uint32_t cnt = 0;
+          for (int j = 0; j < (int)pcm_bytes; j += 4) {
+            volatile uint32_t *sample = (volatile uint32_t *)(&fec_chunk->fragment->payload[j]);
+            uint32_t tmpData = (((uint32_t)scratch[cnt] << 16) & 0xFFFF0000) |
+                               (((uint32_t)scratch[cnt + 1] << 0) & 0x0000FFFF);
+            *sample = (volatile uint32_t)tmpData;
+            cnt += 2;
+          }
+        }
+        insert_pcm_chunk(fec_chunk);
+      }
+    }
+    if (pkts_fec_recovered) *pkts_fec_recovered += gap;
+  }
+
+  // Normal decode of the in-order packet.
+  int frame_size = opus_decode(dec, opus_data, opus_len, scratch, samples_per_frame, 0);
+  if (frame_size > 0) {
+    pcm_chunk_message_t *new_chunk = NULL;
+    if (allocate_pcm_chunk_memory(&new_chunk, pcm_bytes) >= 0) {
+      new_chunk->timestamp.sec = ts_sec;
+      new_chunk->timestamp.usec = ts_usec;
+      if (new_chunk->fragment->payload) {
+        uint32_t cnt = 0;
+        for (int j = 0; j < (int)pcm_bytes; j += 4) {
+          volatile uint32_t *sample = (volatile uint32_t *)(&new_chunk->fragment->payload[j]);
+          uint32_t tmpData = (((uint32_t)scratch[cnt] << 16) & 0xFFFF0000) |
+                             (((uint32_t)scratch[cnt + 1] << 0) & 0x0000FFFF);
+          *sample = (volatile uint32_t)tmpData;
+          cnt += 2;
+        }
+      }
+#if CONFIG_USE_DSP_PROCESSOR
+      if (new_chunk->fragment->payload) {
+        dsp_processor_worker(new_chunk->fragment->payload,
+                             new_chunk->fragment->size, scSet->sr);
+      }
+#endif
+      insert_pcm_chunk(new_chunk);
+      if (pkts_decoded) (*pkts_decoded)++;
+    }
+  }
+}
+
+/**
+ * Drain as many in-order packets from the reorder buffer as possible. When
+ * `force_flush` is true (or the oldest buffered slot is older than the jitter
+ * hold interval), the expected sequence skips forward to the first available
+ * slot — the gap is surfaced to the decode helper which fills it with PLC/FEC.
+ */
+static void udp_reorder_drain(OpusDecoder *dec,
+                               snapcastSetting_t *scSet,
+                               opus_int16 *scratch,
+                               size_t scratch_bytes,
+                               bool force_flush,
+                               uint32_t *pkts_decoded,
+                               uint32_t *pkts_fec_recovered) {
+  if (!udp_reorder_buf) return;
+  TickType_t now = xTaskGetTickCount();
+
+  while (1) {
+    int idx = udp_reorder_next_seq % UDP_REORDER_SIZE;
+    udp_reorder_slot_t *slot = &udp_reorder_buf[idx];
+
+    if (slot->filled && slot->seq == udp_reorder_next_seq) {
+      udp_decode_and_insert(dec, scSet, scratch, scratch_bytes,
+                            slot->opus_data, slot->opus_len,
+                            slot->ts_sec, slot->ts_usec, 0,
+                            pkts_decoded, pkts_fec_recovered);
+      slot->filled = false;
+      udp_reorder_next_seq++;
+      continue;
+    }
+
+    // Expected slot is empty: do we keep waiting, or skip forward?
+    bool any_aged = false;
+    for (int i = 0; i < UDP_REORDER_SIZE; i++) {
+      if (udp_reorder_buf[i].filled &&
+          (now - udp_reorder_buf[i].arrival) >= pdMS_TO_TICKS(UDP_JITTER_HOLD_MS)) {
+        any_aged = true;
+        break;
+      }
+    }
+    if (!force_flush && !any_aged) return;
+
+    // Find the nearest filled slot ahead of next_seq and advance to it.
+    uint16_t min_offset = 0xFFFF;
+    for (int i = 0; i < UDP_REORDER_SIZE; i++) {
+      if (!udp_reorder_buf[i].filled) continue;
+      uint16_t off = (uint16_t)(udp_reorder_buf[i].seq - udp_reorder_next_seq);
+      if (off < UDP_REORDER_SIZE && off < min_offset) min_offset = off;
+    }
+    if (min_offset == 0xFFFF) return;  // no forward slot available
+
+    udp_reorder_next_seq += min_offset;
+    int idx2 = udp_reorder_next_seq % UDP_REORDER_SIZE;
+    udp_reorder_slot_t *s2 = &udp_reorder_buf[idx2];
+    if (!s2->filled) return;  // shouldn't happen, but be defensive
+    udp_decode_and_insert(dec, scSet, scratch, scratch_bytes,
+                          s2->opus_data, s2->opus_len,
+                          s2->ts_sec, s2->ts_usec, min_offset,
+                          pkts_decoded, pkts_fec_recovered);
+    s2->filled = false;
+    udp_reorder_next_seq++;
+  }
+}
+
+/**
  * UDP receive task: receives WireChunk datagrams from the server,
- * decodes Opus with FEC/PLC awareness, and inserts PCM into the player queue.
+ * stashes them in a jitter/reorder buffer, then drains them in sequence
+ * through the Opus decode helper (which handles FEC/PLC).
  */
 static void udp_recv_task(void *pvParameters) {
   snapcastSetting_t *scSetPtr = (snapcastSetting_t *)pvParameters;
@@ -517,6 +713,20 @@ static void udp_recv_task(void *pvParameters) {
     vTaskDelete(NULL);
     return;
   }
+
+  // Allocate reorder buffer + decode scratch once. Freed on task exit.
+  udp_reorder_buf = (udp_reorder_slot_t *)calloc(UDP_REORDER_SIZE, sizeof(udp_reorder_slot_t));
+  udp_decode_scratch = (opus_int16 *)malloc(UDP_DECODE_SCRATCH_BYTES);
+  if (!udp_reorder_buf || !udp_decode_scratch) {
+    ESP_LOGE(TAG, "UDP: failed to allocate reorder/scratch buffers");
+    if (udp_reorder_buf) { free(udp_reorder_buf); udp_reorder_buf = NULL; }
+    if (udp_decode_scratch) { free(udp_decode_scratch); udp_decode_scratch = NULL; }
+    opus_decoder_destroy(udpOpusDecoder);
+    vTaskDelete(NULL);
+    return;
+  }
+  udp_reorder_initialized = false;
+  udp_reorder_next_seq = 0;
 
   ESP_LOGI(TAG, "UDP recv task started (opus decoder: %ldHz %dch)", scSetPtr->sr, scSetPtr->ch);
 
@@ -611,16 +821,6 @@ static void udp_recv_task(void *pvParameters) {
       continue;
     }
 
-    // Sequence gap detection
-    uint16_t gap = 0;
-    if (udp_sequence_initialized) {
-      gap = (uint16_t)(msg_id - udp_expected_sequence);
-      if (gap > 1000) gap = 0;  // wrapped or reordered, treat as normal
-    } else {
-      udp_sequence_initialized = true;
-    }
-    udp_expected_sequence = msg_id + 1;
-
     if (scSetPtr->sr == 0 || scSetPtr->ch == 0 || scSetPtr->bits == 0) {
       udp_pkts_dropped++;
       netbuf_delete(buf);
@@ -628,146 +828,109 @@ static void udp_recv_task(void *pvParameters) {
       continue;
     }
 
-    int samples_per_frame = opus_packet_get_samples_per_frame(opus_data, scSetPtr->sr);
-    if (samples_per_frame < 0) {
+    // Push settings to the player once we can peek the first valid frame size.
+    // (Doesn't depend on a successful decode, so do it before the reorder
+    //  buffer possibly parks the packet.)
+    if (!settings_sent) {
+      int spf = opus_packet_get_samples_per_frame(opus_data, scSetPtr->sr);
+      if (spf > 0) {
+        scSetPtr->chkInFrames = spf;
+        if (player_send_snapcast_setting(scSetPtr) == pdPASS) {
+          ESP_LOGI(TAG,
+                   "UDP: got settings and notified player_task (chkInFrames=%d)",
+                   spf);
+        }
+        settings_sent = true;
+      }
+    }
+
+    if (opus_len == 0 || opus_len > UDP_MAX_OPUS_LEN) {
+      udp_pkts_dropped++;
       netbuf_delete(buf);
       buf = NULL;
       continue;
     }
 
-    size_t pcm_bytes = samples_per_frame * (scSetPtr->ch * scSetPtr->bits >> 3);
-
-    // Handle packet loss via FEC/PLC
-    if (gap > 0) {
-      // For gaps > 1, use PLC for the earlier lost packets
-      for (uint16_t i = 0; i < gap - 1 && i < 3; i++) {
-        opus_int16 *plc_audio = (opus_int16 *)malloc(pcm_bytes);
-        if (plc_audio) {
-          int plc_size = opus_decode(udpOpusDecoder, NULL, 0, plc_audio, samples_per_frame, 0);
-          if (plc_size > 0) {
-            pcm_chunk_message_t *plc_chunk = NULL;
-            if (allocate_pcm_chunk_memory(&plc_chunk, pcm_bytes) >= 0) {
-              // Interpolate timestamp for PLC frame
-              int64_t chunk_dur_us = 1000000LL * samples_per_frame / scSetPtr->sr;
-              int64_t base_ts = (int64_t)ts_sec * 1000000LL + ts_usec;
-              int64_t plc_ts = base_ts - (int64_t)(gap - i) * chunk_dur_us;
-              plc_chunk->timestamp.sec = plc_ts / 1000000LL;
-              plc_chunk->timestamp.usec = plc_ts % 1000000LL;
-
-              if (plc_chunk->fragment->payload) {
-                uint32_t cnt = 0;
-                for (int j = 0; j < (int)pcm_bytes; j += 4) {
-                  volatile uint32_t *sample = (volatile uint32_t *)(&plc_chunk->fragment->payload[j]);
-                  uint32_t tmpData = (((uint32_t)plc_audio[cnt] << 16) & 0xFFFF0000) |
-                                     (((uint32_t)plc_audio[cnt + 1] << 0) & 0x0000FFFF);
-                  *sample = (volatile uint32_t)tmpData;
-                  cnt += 2;
-                }
-              }
-              insert_pcm_chunk(plc_chunk);
-            }
-          }
-          free(plc_audio);
-        }
-      }
-
-      // For the most recently lost packet, use FEC from current packet
-      opus_int16 *fec_audio = (opus_int16 *)malloc(pcm_bytes);
-      if (fec_audio) {
-        int fec_size = opus_decode(udpOpusDecoder, opus_data, opus_len, fec_audio, samples_per_frame, 1);
-        if (fec_size > 0) {
-          pcm_chunk_message_t *fec_chunk = NULL;
-          if (allocate_pcm_chunk_memory(&fec_chunk, pcm_bytes) >= 0) {
-            int64_t chunk_dur_us = 1000000LL * samples_per_frame / scSetPtr->sr;
-            int64_t base_ts = (int64_t)ts_sec * 1000000LL + ts_usec;
-            int64_t fec_ts = base_ts - chunk_dur_us;
-            fec_chunk->timestamp.sec = fec_ts / 1000000LL;
-            fec_chunk->timestamp.usec = fec_ts % 1000000LL;
-
-            if (fec_chunk->fragment->payload) {
-              uint32_t cnt = 0;
-              for (int j = 0; j < (int)pcm_bytes; j += 4) {
-                volatile uint32_t *sample = (volatile uint32_t *)(&fec_chunk->fragment->payload[j]);
-                uint32_t tmpData = (((uint32_t)fec_audio[cnt] << 16) & 0xFFFF0000) |
-                                   (((uint32_t)fec_audio[cnt + 1] << 0) & 0x0000FFFF);
-                *sample = (volatile uint32_t)tmpData;
-                cnt += 2;
-              }
-            }
-            insert_pcm_chunk(fec_chunk);
-          }
-        }
-        free(fec_audio);
-      }
-
-      if (gap > 0) {
-        udp_pkts_fec_recovered += gap;
-        ESP_LOGW(TAG, "UDP: lost %d packets, recovered with FEC/PLC", gap);
-      }
+    // Reorder buffer bookkeeping.
+    if (!udp_reorder_initialized) {
+      udp_reorder_next_seq = msg_id;
+      udp_reorder_initialized = true;
     }
 
-    // Normal decode of current packet
-    opus_int16 *audio = (opus_int16 *)malloc(pcm_bytes);
-    if (audio) {
-      int frame_size = opus_decode(udpOpusDecoder, opus_data, opus_len, audio, samples_per_frame, 0);
-      if (frame_size > 0) {
-        pcm_chunk_message_t *new_chunk = NULL;
-        if (allocate_pcm_chunk_memory(&new_chunk, pcm_bytes) >= 0) {
-          new_chunk->timestamp.sec = ts_sec;
-          new_chunk->timestamp.usec = ts_usec;
+    int16_t diff = (int16_t)(msg_id - udp_reorder_next_seq);
+    if (diff < 0) {
+      // Packet arrived after we already skipped past its sequence number.
+      udp_pkts_dropped++;
+      netbuf_delete(buf);
+      buf = NULL;
+      continue;
+    }
+    if (diff >= UDP_REORDER_SIZE) {
+      // Packet is beyond the reorder window. Drain anything still parked,
+      // then decode the new packet directly with an explicit gap so the
+      // helper runs PLC/FEC and keeps the Opus decoder state aligned with
+      // the advancing sequence number. Skipping straight to `msg_id` here
+      // (as an earlier version did) would desync the decoder and leave a
+      // silent hole in the player's timeline.
+      udp_reorder_drain(udpOpusDecoder, scSetPtr, udp_decode_scratch,
+                        UDP_DECODE_SCRATCH_BYTES, true,
+                        &udp_pkts_decoded, &udp_pkts_fec_recovered);
 
-          if (new_chunk->fragment->payload) {
-            uint32_t cnt = 0;
-            for (int j = 0; j < (int)pcm_bytes; j += 4) {
-              volatile uint32_t *sample = (volatile uint32_t *)(&new_chunk->fragment->payload[j]);
-              uint32_t tmpData = (((uint32_t)audio[cnt] << 16) & 0xFFFF0000) |
-                                 (((uint32_t)audio[cnt + 1] << 0) & 0x0000FFFF);
-              *sample = (volatile uint32_t)tmpData;
-              cnt += 2;
-            }
-          }
+      uint16_t skipped = (uint16_t)(msg_id - udp_reorder_next_seq);
+      udp_decode_and_insert(udpOpusDecoder, scSetPtr, udp_decode_scratch,
+                            UDP_DECODE_SCRATCH_BYTES,
+                            opus_data, opus_len, ts_sec, ts_usec,
+                            skipped,
+                            &udp_pkts_decoded, &udp_pkts_fec_recovered);
+      udp_reorder_next_seq = msg_id + 1;
 
-#if CONFIG_USE_DSP_PROCESSOR
-          if (new_chunk->fragment->payload) {
-            dsp_processor_worker(new_chunk->fragment->payload,
-                                 new_chunk->fragment->size, scSetPtr->sr);
-          }
-#endif
-
-          insert_pcm_chunk(new_chunk);
-          udp_pkts_decoded++;
-
-          // After first successful decode, update chkInFrames with
-          // actual frame size and push settings to the player task.
-          if (!settings_sent) {
-            scSetPtr->chkInFrames = samples_per_frame;
-            if (player_send_snapcast_setting(scSetPtr) == pdPASS) {
-              ESP_LOGI(TAG, "UDP: got settings and notified player_task "
-                       "(chkInFrames=%d)", samples_per_frame);
-            }
-            settings_sent = true;
-          }
-        }
-      }
-      free(audio);
+      netbuf_delete(buf);
+      buf = NULL;
+      continue;
     }
 
-    // Store last packet for potential FEC use (not strictly needed since we
-    // decode reactively, but keep for future lookahead)
-    if (udp_last_opus_pkt) free(udp_last_opus_pkt);
-    udp_last_opus_pkt = (uint8_t *)malloc(opus_len);
-    if (udp_last_opus_pkt) {
-      memcpy(udp_last_opus_pkt, opus_data, opus_len);
-      udp_last_opus_pkt_len = opus_len;
+    udp_reorder_slot_t *slot = &udp_reorder_buf[msg_id % UDP_REORDER_SIZE];
+    if (slot->filled && slot->seq == msg_id) {
+      // Duplicate — ignore.
+      udp_pkts_dropped++;
+      netbuf_delete(buf);
+      buf = NULL;
+      continue;
     }
+    slot->filled = true;
+    slot->seq = msg_id;
+    slot->ts_sec = ts_sec;
+    slot->ts_usec = ts_usec;
+    slot->opus_len = opus_len;
+    slot->arrival = xTaskGetTickCount();
+    memcpy(slot->opus_data, opus_data, opus_len);
+
+    udp_reorder_drain(udpOpusDecoder, scSetPtr, udp_decode_scratch,
+                      UDP_DECODE_SCRATCH_BYTES, false,
+                      &udp_pkts_decoded, &udp_pkts_fec_recovered);
 
     netbuf_delete(buf);
     buf = NULL;
   }
 
+  // Final drain of any packets still sitting in the reorder buffer so they
+  // don't silently disappear on shutdown.
+  udp_reorder_drain(udpOpusDecoder, scSetPtr, udp_decode_scratch,
+                    UDP_DECODE_SCRATCH_BYTES, true,
+                    &udp_pkts_decoded, &udp_pkts_fec_recovered);
+
   if (udpOpusDecoder) {
     opus_decoder_destroy(udpOpusDecoder);
   }
+  if (udp_reorder_buf) {
+    free(udp_reorder_buf);
+    udp_reorder_buf = NULL;
+  }
+  if (udp_decode_scratch) {
+    free(udp_decode_scratch);
+    udp_decode_scratch = NULL;
+  }
+  udp_reorder_initialized = false;
   ESP_LOGI(TAG, "UDP recv task exiting");
   vTaskDelete(NULL);
 }
@@ -832,12 +995,8 @@ static void http_get_task(void *pvParameters) {
         netconn_delete(udpNetconn);
         udpNetconn = NULL;
       }
-      if (udp_last_opus_pkt) {
-        free(udp_last_opus_pkt);
-        udp_last_opus_pkt = NULL;
-        udp_last_opus_pkt_len = 0;
-      }
-      udp_sequence_initialized = false;
+      udp_reorder_initialized = false;
+      udp_reorder_next_seq = 0;
 
       // Now safe to destroy decoders
       if (opusDecoder != NULL) {
@@ -2280,11 +2439,8 @@ static void http_get_task(void *pvParameters) {
                             netconn_delete(udpNetconn);
                             udpNetconn = NULL;
                           }
-                          if (udp_last_opus_pkt) {
-                            free(udp_last_opus_pkt);
-                            udp_last_opus_pkt = NULL;
-                            udp_last_opus_pkt_len = 0;
-                          }
+                          udp_reorder_initialized = false;
+                          udp_reorder_next_seq = 0;
 
                           udpNetconn = netconn_new(NETCONN_UDP);
                           if (udpNetconn) {
@@ -2313,8 +2469,8 @@ static void http_get_task(void *pvParameters) {
                                   // Actually keep connected so recv works as expected
 
                                   udp_active = true;
-                                  udp_sequence_initialized = false;
-                                  udp_expected_sequence = 0;
+                                  udp_reorder_initialized = false;
+                                  udp_reorder_next_seq = 0;
 
                                   // Store MAC for periodic re-registration
                                   strncpy(udp_client_mac, mac_address, sizeof(udp_client_mac) - 1);
