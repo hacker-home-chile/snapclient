@@ -1229,8 +1229,11 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
   //    free_pcm_chunk(element);
   //  }
 
-  // if (xQueueSend(pcmChkQHdl, &pcmChunk, pdMS_TO_TICKS(10)) != pdTRUE) {
-  if (xQueueSend(pcmChkQHdl, &pcmChunk, pdMS_TO_TICKS(1)) != pdTRUE) {
+  // Wait up to ~half a chunk duration (20ms default chunks → 10ms) so a
+  // momentarily busy player task — e.g. refilling I2S DMA or running an
+  // APLL adjustment — doesn't cause us to drop the chunk outright. A 1ms
+  // timeout here was directly observable as audible stutter under load.
+  if (xQueueSend(pcmChkQHdl, &pcmChunk, pdMS_TO_TICKS(10)) != pdTRUE) {
     ESP_LOGW(TAG, "send: pcmChunkQueue full, messages waiting %d",
              uxQueueMessagesWaiting(pcmChkQHdl));
 
