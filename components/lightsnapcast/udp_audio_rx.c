@@ -97,6 +97,7 @@ static uint32_t      g_next_expected_seq = 0;
 static uint32_t      g_highest_group_closed = 0;
 
 static udp_audio_rx_stats_t g_stats = {0};
+static uint32_t g_highest_seq = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -281,6 +282,7 @@ static void on_packet(const udp_audio_header_t* h, const uint8_t* payload, size_
     if (h->fec_group_size == 0 || h->fec_group_size > 8) { g_stats.rx_bad++; return; }
 
     g_stats.rx_ok++;
+    if (h->seq > g_highest_seq) g_highest_seq = h->seq;
 
     if (!g_have_first)
     {
@@ -295,8 +297,27 @@ static void on_packet(const udp_audio_header_t* h, const uint8_t* payload, size_
         g_stats.reorder_late++;
         return;
     }
-    // If seq is too far in the future, we risk ring collisions — flush head.
-    if (diff >= UDP_RX_RING_SIZE)
+    // If seq is too far in the future, we risk ring collisions.
+    //
+    // Two regimes:
+    //   - "Moderate" gap (RING_SIZE..MAX_CATCHUP slots): flush head so the
+    //     ring can absorb newer packets, PLC each missing seq.
+    //   - "Huge" gap (> MAX_CATCHUP slots): the server almost certainly had
+    //     per-client state from a previous session and we're anchored to a
+    //     stale seq baseline. PLC'ing tens of thousands of "missing" frames
+    //     would starve the rx task (each opus_decode(NULL) takes ms) and
+    //     cascade into real packet loss. Drop the old anchor, clear the
+    //     ring, and re-anchor at this packet. We lose one burst's worth
+    //     of continuity; the player resyncs via the existing HARD-1 path.
+    #define UDP_RX_MAX_CATCHUP 256  // ≈ 5 s of audio, generous but bounded
+    if (diff > UDP_RX_MAX_CATCHUP)
+    {
+        ESP_LOGW(TAG, "huge seq jump %u → %u, re-anchoring", g_next_expected_seq, h->seq);
+        for (size_t i = 0; i < UDP_RX_RING_SIZE; ++i) g_ring[i].valid = false;
+        memset(g_groups, 0, sizeof(g_groups));
+        g_next_expected_seq = h->seq;
+    }
+    else if (diff >= UDP_RX_RING_SIZE)
     {
         drain_ring_in_order(h->seq - UDP_RX_RING_SIZE + 1);
     }
@@ -419,10 +440,10 @@ static void stats_log(void)
     last_us = now;
     ESP_LOGI(TAG,
              "rx=%"PRIu32" bad=%"PRIu32" drop=%"PRIu32" fec=%"PRIu32
-             " plc=%"PRIu32" late=%"PRIu32" dec=%"PRIu32,
+             " plc=%"PRIu32" late=%"PRIu32" dec=%"PRIu32" max_seq=%"PRIu32,
              g_stats.rx_ok, g_stats.rx_bad, g_stats.drop_detected,
              g_stats.fec_recovered, g_stats.plc_invoked,
-             g_stats.reorder_late, g_stats.decoded_ok);
+             g_stats.reorder_late, g_stats.decoded_ok, g_highest_seq);
 }
 
 static void udp_rx_task(void* arg)
@@ -434,6 +455,15 @@ static void udp_rx_task(void* arg)
     int64_t last_reg = 0;
     // Static — single-threaded receive path; keeps it off the task stack.
     static uint8_t buf[UDP_RX_MAX_PAYLOAD + UDP_AUDIO_HEADER_SIZE + 16];
+
+    // Resolve the configured server IP once; packets from any other source
+    // are dropped. Without this, a leftover snapserver on the LAN still
+    // holding our MAC in its client table will keep blasting audio at us,
+    // mixing its seq stream with our real server's and breaking the player.
+    struct in_addr expected_src;
+    expected_src.s_addr = 0;
+    if (g_cfg.server_ip && inet_aton(g_cfg.server_ip, &expected_src) == 0)
+        ESP_LOGW(TAG, "could not parse server_ip '%s' for src filter", g_cfg.server_ip);
 
     while (true)
     {
@@ -449,6 +479,12 @@ static void udp_rx_task(void* arg)
         int n = recvfrom(g_sock, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
         if (n <= 0) {
             stats_log();
+            continue;
+        }
+
+        // Source-IP filter.
+        if (expected_src.s_addr != 0 && from.sin_addr.s_addr != expected_src.s_addr) {
+            g_stats.rx_bad++;
             continue;
         }
         if ((size_t)n < UDP_AUDIO_HEADER_SIZE) { g_stats.rx_bad++; continue; }

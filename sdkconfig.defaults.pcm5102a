@@ -38,7 +38,7 @@ CONFIG_WIFI_AUTH_WPA2_WPA3_PSK=n
 CONFIG_WIFI_AUTH_WPA_WPA2_PSK=y
 # mDNS off → use static server host/port below.
 # CONFIG_SNAPSERVER_USE_MDNS is not set
-CONFIG_SNAPSERVER_HOST="192.168.0.11"
+CONFIG_SNAPSERVER_HOST="192.168.0.250"
 CONFIG_SNAPSERVER_PORT=1704
 # Disable the third-party UDP logger component — it heap-corrupts under load
 # on our flow and competes for the lwIP mbox we need for the audio stream.
