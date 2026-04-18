@@ -1779,7 +1779,12 @@ static void player_task(void *pvParameters) {
 
       const int64_t shortOffset = SHORT_OFFSET;  // µs, softsync
       const int64_t miniOffset = MINI_OFFSET;    // µs, softsync
-      const int64_t hardResyncThreshold = 2000;  // µs, hard sync
+      // udp-music: UDP + wifi naturally jitters a few ms per-packet; the
+      // original 2 ms threshold was tuned for TCP's back-to-back framing
+      // and causes a HARD-2 teardown every ~2 s under perfectly clean
+      // UDP reception. Relax to one frame (20 ms) so the sample-insertion
+      // / APLL soft-sync loop below handles sub-frame drift on its own.
+      const int64_t hardResyncThreshold = 20000;  // µs, hard sync
 
       if (initialSync == 1) {
         if (size == 0) {
@@ -2000,10 +2005,21 @@ static void player_task(void *pvParameters) {
 
           // resync hard if we are getting very late / early.
           // rest gets tuned in through apll speed control or sample insertion
-          if ((msgWaiting == 0) ||
+          //
+          // udp-music: a momentary queue drain under UDP+wifi jitter used to
+          // tear down I2S via the `msgWaiting == 0` arm. Track how many
+          // consecutive underruns we see before declaring it real — one
+          // brief drain between a pair of arrivals isn't worth a full
+          // resync when the median is still tight.
+          static int consecutive_empty = 0;
+          if (msgWaiting == 0) consecutive_empty++;
+          else                 consecutive_empty = 0;
+          const bool underrun_real = consecutive_empty >= 4;
+
+          if (underrun_real ||
               (MEDIANFILTER_isFull(&shortMedianFilter, 0) &&
                ((shortMedian > hardResyncThreshold) ||
-                (shortMedian < -hardResyncThreshold)))) 
+                (shortMedian < -hardResyncThreshold))))
           {
             if (chnk != NULL) {
               free_pcm_chunk(chnk);
