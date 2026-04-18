@@ -1027,20 +1027,16 @@ int process_data(snapcast_protocol_parser_t *parser,
 
   switch (base_message_rx.type) {
     case SNAPCAST_MESSAGE_WIRE_CHUNK: {
-      wire_chunk_message_t wire_chnk = {{0, 0}, 0, NULL};  // is wire_chnk.payload ever used?
-
-      // skip this wires chunk message if codec header message was not received yet!
-      if (*received_codec_header == false) {
-        if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
-          return -1;
-        }
-        return 0;
-      }
-
-      if (parse_wire_chunk_message(parser, &base_message_rx, *codec, pcmData, &wire_chnk, &decoderChunk) != PARSER_OK) {
+      // udp-music: audio arrives over UDP (udp_audio_rx); the TCP session
+      // is control-only. Stock snapservers still fan WireChunks out to
+      // every TCP client regardless, so we drain the payload to keep the
+      // stream parser in sync, but we do NOT decode or enqueue it —
+      // otherwise the player gets double-fed (one chunk per UDP arrival
+      // plus one per TCP arrival, same server timestamp), its queue
+      // overruns, and the sync math degenerates into permanent flicker.
+      if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
         return -1;
       }
-      handle_chunk_message(*codec, scSet, pcmData, &wire_chnk);
       return 0;
     }
 
