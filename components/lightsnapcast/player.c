@@ -98,6 +98,13 @@ static sMedianNode_t miniMedianBuffer[MINI_BUFFER_LEN];
 
 static int8_t currentDir = 0;  //!< current apll direction, see apll_adjust()
 
+// udp-music: HARD-1 resync stall tracking. Incremented each loop iteration
+// that lands in the "age >= 0" branch, cleared the moment we schedule a
+// chunk successfully. If it crosses ~3 s (600 iterations at 5 ms delay) we
+// conclude the TCP Time sync is stale and force a latency-buffer reset.
+static uint32_t s_hard1_streak = 0;
+static int64_t  s_hard1_last_log_us = 0;
+
 static QueueHandle_t pcmChkQHdl = NULL;
 
 static TaskHandle_t playerTaskHandle = NULL;
@@ -1736,42 +1743,67 @@ static void player_task(void *pvParameters) {
             chnk = NULL;
           }
 
-          wifi_ap_record_t ap;
-          esp_wifi_sta_get_ap_info(&ap);
-
           my_gptimer_stop(gptimer);
-          
+
           int msgWaiting = uxQueueMessagesWaiting(pcmChkQHdl);
 
-          ESP_LOGW(TAG,
-                   "RESYNCING HARD 1: age %lldus, latency %lldus, free %d, "
-                   "largest block %d, rssi: %d, left in queue %d",
-                   age, diff2Server, heap_caps_get_free_size(MALLOC_CAP_32BIT),
-                   heap_caps_get_largest_free_block(MALLOC_CAP_32BIT), ap.rssi, msgWaiting);
-                   
-          // get count of chunks we are late for
-          uint32_t c = ceil((float)age / (float)chunkDuration_us);  // round up
+          // udp-music: under bad wifi the TCP Time sync can stall —
+          // diff2Server freezes while real offset drifts, so every chunk
+          // looks "late" forever. Without intervention this loop spams
+          // ~70 logs/s, starves IDLE1, and trips the task watchdog.
+          //
+          // Three things here:
+          //   1) Log at 1 Hz max (still visible, doesn't flood UART).
+          //   2) vTaskDelay each iteration so IDLE1 gets CPU.
+          //   3) After N consecutive hits (≈3 s), force-drain the chunk
+          //      queue and reset the latency filter so the next time-sync
+          //      reply re-establishes a fresh playout offset.
+          s_hard1_streak++;
+          int64_t now_us_h1 = esp_timer_get_time();
+          if (now_us_h1 - s_hard1_last_log_us > 1000000) {
+            wifi_ap_record_t ap;
+            esp_wifi_sta_get_ap_info(&ap);
+            ESP_LOGW(TAG,
+                     "RESYNCING HARD 1: age %lldus, latency %lldus, free %d, "
+                     "largest block %d, rssi: %d, in queue %d, streak %lu",
+                     age, diff2Server, heap_caps_get_free_size(MALLOC_CAP_32BIT),
+                     heap_caps_get_largest_free_block(MALLOC_CAP_32BIT), ap.rssi,
+                     msgWaiting, (unsigned long)s_hard1_streak);
+            s_hard1_last_log_us = now_us_h1;
+          }
 
-          // now clear all those chunks which are probably late too
-          while (c--) {
-            ret = xQueueReceive(pcmChkQHdl, &chnk, pdMS_TO_TICKS(1));
-            if (ret == pdPASS) {
-              free_pcm_chunk(chnk);
-              chnk = NULL;
-            } else {
-              break;
+          // ~3 s of stalling (our loop sleeps 5 ms below, so 600 iter)
+          if (s_hard1_streak > 600) {
+            ESP_LOGW(TAG, "RESYNCING HARD 1: stuck; resetting latency buffer");
+            reset_latency_buffer();
+            pcm_chunk_message_t* drain;
+            while (xQueueReceive(pcmChkQHdl, &drain, 0) == pdPASS)
+              free_pcm_chunk(drain);
+            s_hard1_streak = 0;
+          } else {
+            uint32_t c = ceil((float)age / (float)chunkDuration_us);
+            while (c--) {
+              ret = xQueueReceive(pcmChkQHdl, &chnk, pdMS_TO_TICKS(1));
+              if (ret == pdPASS) {
+                free_pcm_chunk(chnk);
+                chnk = NULL;
+              } else {
+                break;
+              }
             }
           }
 
           dir = 0;
-
           insertedSamplesCounter = 0;
-
           audio_set_mute(true);
-
           my_i2s_channel_disable(tx_chan);
 
+          // Yield so IDLE1 runs and the watchdog stays happy.
+          vTaskDelay(pdMS_TO_TICKS(5));
           continue;
+        } else {
+          // age < 0 → we can schedule this chunk; the stall is over.
+          s_hard1_streak = 0;
         }
       }
 
