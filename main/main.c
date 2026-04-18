@@ -33,7 +33,8 @@
 #include "network_interface.h"
 #include "nvs_flash.h"
 
-#include "esp32_udp_logger.h"
+// udp-music: udp_logger disabled (heap-corrupting under load).
+// #include "esp32_udp_logger.h"
 
 // Web socket server
 // #include "websocket_if.h"
@@ -55,6 +56,11 @@
 #include "connection_handler.h"
 #include "ota_server.h"
 #include "player.h"
+#include "udp_audio_rx.h"
+
+// udp-music: populated by connection_handler.c on successful TCP connect.
+extern char     snap_server_ip[];
+extern uint16_t snap_server_port;
 #include "settings_manager.h"
 #include "snapcast.h"
 #include "snapcast_protocol_parser.h"
@@ -641,6 +647,16 @@ void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
     }
 
     ESP_LOGI(TAG, "Initialized opus Decoder: %d", error);
+
+    // udp-music: inform the UDP audio receive pipeline of negotiated params
+    // so it can spin up its own opus decoder and start decoding frames.
+    udp_audio_rx_set_codec(OPUS, rate, (uint8_t)channels, (uint8_t)bits);
+
+    // The TCP WireChunk path used to set scSet->chkInFrames on first chunk;
+    // without TCP audio we have to seed it now so gotSettings flips true and
+    // start_player() is allowed to fire when the first PCM chunk arrives.
+    // Server sends 20 ms Opus frames at the negotiated rate.
+    scSet->chkInFrames = rate / 50;
   } else if (codec == FLAC) {
     decoderChunk.bytes = codecPayloadLen;
     do {
@@ -1253,6 +1269,20 @@ static void http_get_task(void *pvParameters) {
 
     ESP_LOGI(TAG, "netconn sent hello message");
 
+    // udp-music: start the UDP audio receive pipeline once TCP is up and
+    // the server address is known. Idempotent — first call wins.
+    {
+        static udp_audio_rx_config_t rx_cfg;
+        static char rx_client_id[24];
+        snprintf(rx_client_id, sizeof(rx_client_id), "%s", mac_address);
+        rx_cfg.local_port   = 4100;
+        rx_cfg.server_ip    = snap_server_ip;
+        rx_cfg.server_port  = 4100;  // must match udp-streaming.port on server
+        rx_cfg.client_id    = rx_client_id;
+        if (udp_audio_rx_start(&rx_cfg) != 0)
+            ESP_LOGW(TAG, "udp_audio_rx_start failed");
+    }
+
     free(hello_message_serialized);
     hello_message_serialized = NULL;
 
@@ -1525,7 +1555,7 @@ void app_main(void) {
   
   #if CONFIG_ESP32_UDP_LOGGER_ENABLED
 //  esp32_udp_logger_set_hostname(mdns_hostname);
-  esp32_udp_logger_autostart();
+//  esp32_udp_logger_autostart();  // udp-music: disabled
   #endif
 
   init_http_server_task();

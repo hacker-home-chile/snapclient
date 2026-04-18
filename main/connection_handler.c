@@ -11,6 +11,11 @@
 // External variable that need to be accessible
 extern struct netconn* lwipNetconn;
 
+// udp-music: last successful server IP+port, exposed for udp_audio_rx to
+// find where to register. Populated on successful netconn_connect.
+char     snap_server_ip[64]   = {0};
+uint16_t snap_server_port     = 0;
+
 static const char* TAG = "CONNECTION_HANDLER";
 
 void setup_network(esp_netif_t** netif) {
@@ -234,6 +239,12 @@ void setup_network(esp_netif_t** netif) {
     }
 
     ESP_LOGI(TAG, "netconn connected using %s", network_get_ifkey(*netif));
+
+    // udp-music: stash the resolved server endpoint so udp_audio_rx can
+    // register to receive the UDP audio stream.
+    snprintf(snap_server_ip, sizeof(snap_server_ip), "%s", ipaddr_ntoa(&remote_ip));
+    snap_server_port = remotePort;
+
     break;  // SUCCESS
   }
 }

@@ -94,10 +94,10 @@ static void event_handler(void *arg, esp_event_base_t event_base, int event_id,
 
       esp_wifi_connect();
       s_retry_num++;
-      ESP_LOGV(TAG, "retry to connect to the AP");
+      ESP_LOGI(TAG, "retry %d to connect to the AP", s_retry_num);
     }
 
-    ESP_LOGV(TAG, "connect to the AP fail");
+    ESP_LOGI(TAG, "connect to the AP fail");
   }
 }
 

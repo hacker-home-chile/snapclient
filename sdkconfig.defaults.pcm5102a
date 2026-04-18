@@ -1,0 +1,48 @@
+# PCM5102A DAC + plain ESP32 defaults (no PSRAM).
+# Layered on top of sdkconfig.defaults via SDKCONFIG_DEFAULTS.
+# WiFi credentials are left to menuconfig (idf.py menuconfig in snapclient).
+
+# Device name
+CONFIG_SNAPCLIENT_NAME="udp-music-esp32"
+
+# Board / DAC
+CONFIG_AUDIO_BOARD_CUSTOM=y
+CONFIG_DAC_PCM5102A=y
+CONFIG_DAC_I2C_SDA=-1
+CONFIG_DAC_I2C_SCL=-1
+CONFIG_DAC_I2C_ADDR=0x20
+
+# I2S pin map (PCM5102A on plain ESP32 dev board)
+CONFIG_MASTER_I2S_MCLK_PIN=0
+CONFIG_MASTER_I2S_BCK_PIN=26
+CONFIG_MASTER_I2S_LRCK_PIN=25
+CONFIG_MASTER_I2S_DATAOUT_PIN=22
+CONFIG_PCM5102A_MUTE_PIN=33
+CONFIG_DAC_DMA_AUTO_16BIT_ALIGN=y
+
+# DSP + soft volume
+CONFIG_USE_DSP_PROCESSOR=y
+CONFIG_SNAPCLIENT_DSP_FLOW_STEREO=y
+CONFIG_SNAPCLIENT_USE_SOFT_VOL=y
+
+# UDP audio transport needs a larger lwIP UDP recv mbox.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+CONFIG_UDP_RECVMBOX_SIZE=32
+
+# WiFi + snapserver (dev). Override via menuconfig/NVS in production.
+CONFIG_WIFI_SSID="hacker-home"
+CONFIG_WIFI_PASSWORD="h4ckTh!s"
+# WPA2/WPA3 mixed causes the ESP32 to reject many WPA2-only APs. Match the
+# reference build at ~/snapclient which happily connects with WPA/WPA2.
+CONFIG_WIFI_AUTH_WPA2_WPA3_PSK=n
+CONFIG_WIFI_AUTH_WPA_WPA2_PSK=y
+# mDNS off → use static server host/port below.
+# CONFIG_SNAPSERVER_USE_MDNS is not set
+CONFIG_SNAPSERVER_HOST="192.168.0.250"
+CONFIG_SNAPSERVER_PORT=1704
+# Disable the third-party UDP logger component — it heap-corrupts under load
+# on our flow and competes for the lwIP mbox we need for the audio stream.
+CONFIG_ESP32_UDP_LOGGER_ENABLED=n
+
+# Temporary: catch heap corruption at the source rather than later in lwIP.
+CONFIG_HEAP_POISONING_LIGHT=y
