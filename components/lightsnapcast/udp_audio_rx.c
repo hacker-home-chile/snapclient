@@ -190,7 +190,8 @@ static bool try_fec_recover(udp_rx_group_t* grp)
     }
     if (miss_seq == UINT32_MAX) return false;
 
-    // XOR together parity + all received data payloads (padded to parity_len).
+    // Compute XOR of parity + all received data in the group; what's left is
+    // the missing data packet's padded payload.
     // Static — single-threaded, avoids 1.5 KB on the task stack.
     static uint8_t recovered[UDP_RX_MAX_PAYLOAD];
     uint16_t plen = grp->parity_len;
@@ -209,15 +210,36 @@ static bool try_fec_recover(udp_rx_group_t* grp)
         for (uint16_t b = 0; b < s->payload_len && b < plen; ++b)
             recovered[b] ^= s->payload[b];
         length_xor ^= (uint32_t)s->payload_len;
-        // Approximate recovered packet's timestamp as the neighbor's — good
-        // enough since all frames in a group are ~N×20 ms apart.
+        // Approximate recovered packet's timestamp: one 20 ms frame after
+        // the latest neighbor we've seen. Good enough; player resyncs
+        // soft-loop corrects the rest.
         timestamp_sec  = s->timestamp_sec;
         timestamp_usec = s->timestamp_usec;
     }
     uint16_t recovered_len = (uint16_t)length_xor;
     if (recovered_len == 0 || recovered_len > plen) return false;
 
-    decode_and_push(recovered, recovered_len, timestamp_sec, timestamp_usec, false);
+    // Write the recovered payload back into its ring slot — drain_ring_in_order
+    // will emit it like any normal packet. Decoding from here would collide
+    // with the drain loop's PLC path.
+    size_t idx = miss_seq & UDP_RX_RING_MASK;
+    udp_rx_slot_t* rs = &g_ring[idx];
+    // Guard against the slot already being reused by a future seq.
+    if (rs->valid && rs->seq != miss_seq) return false;
+    rs->valid         = true;
+    rs->is_parity     = false;
+    rs->seq           = miss_seq;
+    rs->fec_group     = grp->group_id;
+    rs->timestamp_sec = timestamp_sec;
+    rs->timestamp_usec = timestamp_usec;
+    rs->payload_len   = recovered_len;
+    memcpy(rs->payload, recovered, recovered_len);
+
+    // Mark hole as filled so we don't fire again for this group.
+    uint32_t off = miss_seq - grp->expected_first_seq;
+    if (off < 32) grp->seen_seqs_mask |= (1u << off);
+    grp->data_seen++;
+
     g_stats.fec_recovered++;
     return true;
 }
@@ -327,8 +349,15 @@ static void on_packet(const udp_audio_header_t* h, const uint8_t* payload, size_
     // draining the ring in seq order in the main loop.
     (void)try_fec_recover(grp);
 
-    // Drain everything we have in contiguous order up to seq+1.
-    drain_ring_in_order(h->seq + 1);
+    // Drain only the slots far enough behind the newest arrival that parity
+    // has had a chance to land. Parity is emitted right after the last data
+    // packet of the group (group_size apart), so group_size slots of lag is
+    // the theoretical minimum; +1 for mild reorder tolerance. Every extra
+    // frame of lag is 20 ms of playout latency and shifts the sync median,
+    // which in turn triggers HARD-2 resyncs — keep this tight.
+    const uint32_t lag = (uint32_t)h->fec_group_size + 1;
+    if (h->seq + 1 > lag)
+        drain_ring_in_order(h->seq + 1 - lag);
 }
 
 // ── Registration / socket setup ─────────────────────────────────────────────

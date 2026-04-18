@@ -1779,12 +1779,12 @@ static void player_task(void *pvParameters) {
 
       const int64_t shortOffset = SHORT_OFFSET;  // µs, softsync
       const int64_t miniOffset = MINI_OFFSET;    // µs, softsync
-      // udp-music: UDP + wifi naturally jitters a few ms per-packet; the
-      // original 2 ms threshold was tuned for TCP's back-to-back framing
-      // and causes a HARD-2 teardown every ~2 s under perfectly clean
-      // UDP reception. Relax to one frame (20 ms) so the sample-insertion
-      // / APLL soft-sync loop below handles sub-frame drift on its own.
-      const int64_t hardResyncThreshold = 20000;  // µs, hard sync
+      // udp-music: UDP + wifi naturally jitters a few ms per-packet, and the
+      // FEC-recovered-frame path adds a bit more wobble on top. The
+      // original 2 ms threshold was tuned for TCP's back-to-back framing;
+      // one frame (20 ms) was still tight enough to fire under load. Two
+      // frames (40 ms) lets the soft-sync loop handle realistic jitter.
+      const int64_t hardResyncThreshold = 40000;  // µs, hard sync
 
       if (initialSync == 1) {
         if (size == 0) {
